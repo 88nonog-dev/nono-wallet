@@ -1,3 +1,4 @@
-flask
+Flask
 gunicorn
-requests
+SQLAlchemy>=2.0
+psycopg2-binary
