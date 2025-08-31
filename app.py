@@ -17,7 +17,7 @@ def health():
 def whoami():
     token = request.headers.get("X-Auth-Token", "")
     if not token:
-        return jsonify(ok=False, error="missing token"), 401
+        return jsonify(ok=False, error="missing token"), 40
     return jsonify(ok=True, token=token)
 
 # =========================
