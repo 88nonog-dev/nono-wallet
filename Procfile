@@ -1,1 +1,1 @@
-web: gunicorn wsgi:app --bind 0.0.0.0:
+Remove Procfile contents (will use Railway Start Command)
