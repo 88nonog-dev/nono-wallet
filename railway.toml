@@ -2,5 +2,4 @@
 builder = "NIXPACKS"
 
 [deploy]
-# عامل واحد وثريد واحد لتفادي إعادة التدوير/التبديل
 startCommand = "gunicorn wsgi:app --bind 0.0.0.0:${PORT} --workers 1 --threads 1"
