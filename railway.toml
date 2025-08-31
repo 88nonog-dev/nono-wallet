@@ -1,5 +1,6 @@
-# Trigger redeploy for nono-wallet
-# تاريخ: 2025-08-31
-# أي تغيير بهالملف راح يخلي Railway يعيد نشر المشروع
+[build]
+builder = "NIXPACKS"
 
-redeploy = "v3"
+[deploy]
+# عامل واحد وثريد واحد لتفادي إعادة التدوير/التبديل
+startCommand = "gunicorn wsgi:app --bind 0.0.0.0:${PORT} --workers 1 --threads 1"
