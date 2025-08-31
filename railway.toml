@@ -1,7 +1,5 @@
-[build]
-builder = "NIXPACKS"
+# Trigger redeploy for nono-wallet
+# تاريخ: 2025-08-31
+# أي تغيير بهالملف راح يخلي Railway يعيد نشر المشروع
 
-[deploy]
-startCommand = "gunicorn wsgi:app --bind 0.0.0.0:${PORT}"
-# (اختياري) تقدر تخلّي Healthcheck إذا تحب:
-# healthcheckPath = "/health"
+redeploy = "v3"
