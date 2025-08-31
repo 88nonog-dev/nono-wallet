@@ -2,7 +2,6 @@
 builder = "NIXPACKS"
 
 [deploy]
-startCommand = "gunicorn wsgi:app --bind 0.0.0.0:$PORT"
-healthcheckPath = "/health"
-restartPolicyType = "ON_FAILURE"
-restartPolicyMaxRetries = 10
+startCommand = "gunicorn wsgi:app --bind 0.0.0.0:${PORT}"
+# (اختياري) تقدر تخلّي Healthcheck إذا تحب:
+# healthcheckPath = "/health"
