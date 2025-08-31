@@ -21,7 +21,8 @@ def whoami():
     return jsonify(ok=True, token=token)
 
 # =========================
-# خازن بسيط للمحافظ بالميموري
+# خازن بسيط للمحافظ بالميموري (للتجارب)
+# ملاحظة: هذا تخزين مؤقت؛ يُمسح عند إعادة التشغيل. لاحقاً نربط DB.
 # =========================
 wallets = {}
 
@@ -42,6 +43,31 @@ def wallet_balance():
     wallet_id = request.args.get("wallet_id", "")
     if not wallet_id or wallet_id not in wallets:
         return jsonify(ok=False, error="wallet_not_found"), 404
+    return jsonify(ok=True, wallet_id=wallet_id, balance=wallets[wallet_id]["balance"])
+
+# =========================
+# إيداع رصيد في محفظة
+# =========================
+@app.post("/wallet/deposit")
+def wallet_deposit():
+    data = request.get_json(silent=True) or {}
+    wallet_id = data.get("wallet_id", "")
+    amount = data.get("amount", None)
+
+    # تحقق من وجود المحفظة
+    if not wallet_id or wallet_id not in wallets:
+        return jsonify(ok=False, error="wallet_not_found"), 404
+
+    # تحقق من قيمة الإيداع
+    try:
+        amount = float(amount)
+    except (TypeError, ValueError):
+        return jsonify(ok=False, error="invalid_amount"), 400
+
+    if amount <= 0:
+        return jsonify(ok=False, error="amount_must_be_positive"), 400
+
+    wallets[wallet_id]["balance"] += amount
     return jsonify(ok=True, wallet_id=wallet_id, balance=wallets[wallet_id]["balance"])
 
 # =========================
