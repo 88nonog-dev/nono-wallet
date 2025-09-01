@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, request, Response
+from flask import Flask, jsonify, request, Response, render_template, redirect
 import os
 import uuid
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -77,15 +77,15 @@ class WithdrawalRequest(Base):
     amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
     method: Mapped[str] = mapped_column(String(32), nullable=False, default="western_union")
     beneficiary_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    last4: Mapped[str | None] = mapped_column(String(8), nullable=True)  # لبطاقة/معرّف جزئي
-    details: Mapped[str | None] = mapped_column(Text, nullable=True)     # مدينة/ملاحظات
+    last4: Mapped[str | None] = mapped_column(String(8), nullable=True)  # partial id
+    details: Mapped[str | None] = mapped_column(Text, nullable=True)     # note/city/etc.
     status: Mapped[str] = mapped_column(
         Enum(WDStatus.PENDING, WDStatus.PAID, WDStatus.CANCELED, name="wd_status_enum"),
         default=WDStatus.PENDING, index=True
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True, nullable=False)
     paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    tx_id: Mapped[str | None] = mapped_column(String(64), nullable=True)  # معاملة السحب عند الدفع
+    tx_id: Mapped[str | None] = mapped_column(String(64), nullable=True)  # withdraw tx id
     payment_reference: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
 Base.metadata.create_all(bind=engine)
@@ -93,7 +93,7 @@ Base.metadata.create_all(bind=engine)
 # =========================
 # Flask App
 # =========================
-app = Flask(__name__)
+app = Flask(__name__, template_folder="templates")
 
 # 🔐 API Key protection
 API_TOKEN = os.getenv("API_TOKEN", "")
@@ -101,7 +101,7 @@ API_TOKEN = os.getenv("API_TOKEN", "")
 @app.before_request
 def require_api_key():
     # مسارات مفتوحة بدون مفتاح
-    open_paths = {"/health", "/whoami"}
+    open_paths = {"/health", "/whoami", "/", "/dashboard"}
     if request.path in open_paths:
         return
     key = request.headers.get("X-Api-Key", "")
@@ -146,6 +146,18 @@ def add_tx(db, wallet_id: str, tx_type: str, amount: Decimal, counterparty: str 
     )
     db.add(tx)
     return tx
+
+# =========================
+# Dashboard routes (open)
+# =========================
+@app.get("/")
+def root_redirect():
+    return redirect("/dashboard")
+
+@app.get("/dashboard")
+def dashboard():
+    # صفحة HTML بسيطة—الطلبات API تتطلب X-Api-Key
+    return render_template("index.html")
 
 # =========================
 # Health & Whoami
@@ -453,7 +465,7 @@ def withdrawal_create():
             beneficiary_name=beneficiary_name,
             last4=last4,
             details=details,
-            status=WDStatus.PENDING,
+            status="pending",
             created_at=now_utc(),
         )
         db.add(wd)
@@ -519,7 +531,7 @@ def withdrawal_list():
 def withdrawal_mark_paid():
     data = request.get_json(silent=True) or {}
     withdrawal_id = data.get("withdrawal_id", "")
-    payment_reference = data.get("payment_reference")  # رقم وصل/مرجع خارجي اختياري
+    payment_reference = data.get("payment_reference")  # optional
 
     if not withdrawal_id:
         return jsonify(ok=False, error="withdrawal_id_required"), 400
@@ -529,20 +541,19 @@ def withdrawal_mark_paid():
         wd = db.get(WithdrawalRequest, withdrawal_id)
         if not wd:
             return jsonify(ok=False, error="withdrawal_not_found"), 404
-        if wd.status == WDStatus.PAID:
+        if wd.status == "paid":
             return jsonify(ok=False, error="already_paid", tx_id=wd.tx_id), 409
 
         w = db.get(Wallet, wd.wallet_id)
         if not w:
             return jsonify(ok=False, error="wallet_not_found"), 404
 
-        # عند الدفع: نخصم الرصيد ونضيف معاملة سحب
         if w.balance < wd.amount:
             return jsonify(ok=False, error="insufficient_funds"), 400
 
         w.balance = d(w.balance - wd.amount)
         tx = add_tx(db, w.id, TxType.WITHDRAW, wd.amount)
-        wd.status = WDStatus.PAID
+        wd.status = "paid"
         wd.paid_at = now_utc()
         wd.tx_id = tx.id
         wd.payment_reference = payment_reference
