@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Nono Wallet - Dashboard (Enhanced)</title>
+  <title>Nono Wallet - Dashboard (Auto KPIs + Currency)</title>
   <style>
     :root{
       --bg:#0b1020; --card:#141b34; --border:#2a355f; --text:#f2f5ff; --muted:#9fb0ff;
@@ -41,7 +41,6 @@
     .space { height: 6px; }
     .foot { margin-top: 10px; display:flex; justify-content: space-between; align-items:center; }
     a.link { color:#7fb3ff; text-decoration: none; }
-    .iconbtn{display:inline-flex; align-items:center; gap:6px}
     .mini{padding:8px 10px; font-size:12px}
     .copy-wrap{display:flex; gap:8px}
     .kpis{display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:10px}
@@ -50,10 +49,8 @@
     .kpi .v{font-size:20px; font-weight:700}
     .topbar{display:flex; justify-content:space-between; align-items:center; margin-bottom:8px}
     .switch{border:1px solid var(--border); border-radius:10px; padding:8px 12px; background:var(--input)}
-    /* Toast */
     .toast{position:fixed; bottom:24px; left:50%; transform:translateX(-50%); background:#111a; color:#fff; padding:10px 14px; border-radius:10px; backdrop-filter: blur(8px); opacity:0; pointer-events:none; transition:opacity .2s}
     .toast.show{opacity:1}
-    /* Spinner overlay */
     .spinner{position:fixed; inset:0; background:#0004; display:none; align-items:center; justify-content:center; z-index:999}
     .spinner.show{display:flex}
     .spin{width:36px; height:36px; border-radius:50%; border:4px solid #fff6; border-top-color:#fff; animation:sp 1s linear infinite}
@@ -67,14 +64,28 @@
       <button id="themeBtn" class="switch">تبديل السمة (فاتح/داكن)</button>
     </div>
 
-    <!-- KPIs -->
+    <!-- KPIs + Currency -->
     <div class="card">
-      <div class="kpis">
-        <div class="kpi"><h3>إجمالي الإيداعات</h3><div class="v" id="kDeposit">0.00</div></div>
-        <div class="kpi"><h3>إجمالي السحوبات</h3><div class="v" id="kWithdraw">0.00</div></div>
-        <div class="kpi"><h3>صافي التدفق</h3><div class="v" id="kNet">0.00</div></div>
+      <div class="row" style="align-items:end">
+        <div style="grid-column:1 / -1">
+          <div class="kpis">
+            <div class="kpi"><h3>إجمالي الإيداعات</h3><div class="v" id="kDeposit">0.00 IQD</div></div>
+            <div class="kpi"><h3>إجمالي السحوبات</h3><div class="v" id="kWithdraw">0.00 IQD</div></div>
+            <div class="kpi"><h3>صافي التدفق</h3><div class="v" id="kNet">0.00 IQD</div></div>
+          </div>
+          <div class="muted">تُحدَّث تلقائيًا بعد أي عملية، ويمكنك تغيير العملة للعرض فقط.</div>
+        </div>
+        <div>
+          <label>العملة (عرض فقط)</label>
+          <select id="currency">
+            <option value="IQD" selected>IQD</option>
+            <option value="USD">USD</option>
+            <option value="EUR">EUR</option>
+            <option value="GBP">GBP</option>
+            <option value="TRY">TRY</option>
+          </select>
+        </div>
       </div>
-      <div class="muted">يُحدَّث عند “تحميل السجل”.</div>
     </div>
 
     <div class="card">
@@ -239,14 +250,13 @@
     const toast = $("toast");
     const spinner = $("spinner");
 
-    // استعادة قيم محلية
     (function restore() {
       $("apiKey").value = localStorage.getItem("apiKey") || "";
       $("walletId").value = localStorage.getItem("walletId") || "";
       document.documentElement.dataset.theme = localStorage.getItem("theme") || "dark";
+      $("currency").value = localStorage.getItem("currency") || "IQD";
     })();
 
-    // تبديل السمة
     $("themeBtn").onclick = () => {
       const cur = document.documentElement.dataset.theme;
       const next = cur === "dark" ? "light" : "dark";
@@ -254,14 +264,18 @@
       localStorage.setItem("theme", next);
       tip(`تم التبديل إلى سمة ${next === "dark" ? "داكنة" : "فاتحة"}`);
     };
+    $("currency").onchange = () => {
+      localStorage.setItem("currency", $("currency").value);
+      // إعادة عرض القيم الحالية بالعملة الجديدة
+      renderKpis(lastItems);
+      tip("تم تغيير العملة (عرض فقط)");
+    };
 
     $("btnSaveIds").onclick = () => {
       localStorage.setItem("apiKey", $("apiKey").value.trim());
       localStorage.setItem("walletId", $("walletId").value.trim());
       tip("تم الحفظ محليًا");
     };
-
-    // نسخ
     function copy(elId){
       const v = $(elId).value.trim();
       if(!v) return tip("لا يوجد نص للنسخ");
@@ -273,7 +287,6 @@
     $("copyWdName").onclick = ()=>copy("wdName");
     $("copyWdId").onclick = ()=>copy("wdId");
 
-    // Helpers
     function hdrs() {
       const k = $("apiKey").value.trim();
       return { "Content-Type": "application/json", "X-Api-Key": k };
@@ -290,12 +303,16 @@
       note(msg);
     }
 
+    function fmt(n){ return Number(n).toFixed(2); }
+    function cur(){ return $("currency").value; }
+    function fmtc(n){ return `${fmt(n)} ${cur()}`; }
+
     function rowTx(r) {
       const tr = document.createElement("tr");
       tr.innerHTML = `
         <td><code>${r.id}</code></td>
         <td>${pill(r.type)}</td>
-        <td>${Number(r.amount).toFixed(2)}</td>
+        <td>${fmtc(r.amount)}</td>
         <td>${r.created_at}</td>
         <td>${r.counterparty_wallet_id || ""}</td>`;
       return tr;
@@ -321,7 +338,6 @@
       }
     }
 
-    // تحقق بسيط
     function ensureWallet(){ if(!wid()){ tip("أدخل Wallet ID"); return false } return true }
     function ensureAmount(){
       const a = amt();
@@ -329,62 +345,10 @@
       return true;
     }
 
-    // أزرار
-    $("btnCreate").onclick = async () => {
-      try {
-        const data = await http(`${base}/wallet/create`, { method: "POST", headers: hdrs() });
-        $("walletId").value = data.wallet_id;
-        localStorage.setItem("walletId", data.wallet_id);
-        tip(`تم إنشاء محفظة: ${data.wallet_id}`);
-      } catch (e) { tip(e.message); }
-    };
+    // حفظ آخر قائمة معاملات لتحديث KPIs بدون إعادة طلب إذا تغيرت العملة
+    let lastItems = [];
 
-    $("btnDeposit").onclick = async () => {
-      if(!ensureWallet() || !ensureAmount()) return;
-      try {
-        const data = await http(`${base}/wallet/deposit`, {
-          method: "POST", headers: hdrs(),
-          body: JSON.stringify({ wallet_id: wid(), amount: amt() })
-        });
-        tip(`الرصيد: ${data.balance}`);
-      } catch (e) { tip(e.message); }
-    };
-
-    $("btnWithdraw").onclick = async () => {
-      if(!ensureWallet() || !ensureAmount()) return;
-      try {
-        const data = await http(`${base}/wallet/withdraw`, {
-          method: "POST", headers: hdrs(),
-          body: JSON.stringify({ wallet_id: wid(), amount: amt() })
-        });
-        tip(`الرصيد: ${data.balance}`);
-      } catch (e) { tip(e.message); }
-    };
-
-    $("btnBalance").onclick = async () => {
-      if(!ensureWallet()) return;
-      try {
-        const url = `${base}/wallet/balance?wallet_id=${encodeURIComponent(wid())}`;
-        const data = await http(url, { headers: hdrs() });
-        tip(`الرصيد الحالي: ${data.balance}`);
-      } catch (e) { tip(e.message); }
-    };
-
-    $("btnTransfer").onclick = async () => {
-      if(!ensureWallet() || !ensureAmount()) return;
-      const to = $("toWallet").value.trim();
-      if(!to){ tip("أدخل To Wallet ID"); return }
-      try {
-        const data = await http(`${base}/wallet/transfer`, {
-          method: "POST", headers: hdrs(),
-          body: JSON.stringify({ from_wallet_id: wid(), to_wallet_id: to, amount: amt() })
-        });
-        tip(`تحويل ناجح: ${data.amount} → رصيدك: ${data.from_balance}`);
-      } catch (e) { tip(e.message); }
-    };
-
-    // حساب KPIs من السجل
-    function updateKpis(items){
+    function renderKpis(items){
       let dep=0, wd=0;
       for(const r of items){
         const a = Number(r.amount)||0;
@@ -392,12 +356,12 @@
         if(r.type==="withdraw" || r.type==="transfer_out") wd  += a;
       }
       const net = dep - wd;
-      $("kDeposit").textContent = dep.toFixed(2);
-      $("kWithdraw").textContent = wd.toFixed(2);
-      $("kNet").textContent = net.toFixed(2);
+      $("kDeposit").textContent = fmtc(dep);
+      $("kWithdraw").textContent = fmtc(wd);
+      $("kNet").textContent = fmtc(net);
     }
 
-    $("btnLoad").onclick = async () => {
+    async function loadTx(){
       if(!ensureWallet()) return;
       const t = $("type").value.trim();
       const f = $("from").value.trim();
@@ -407,14 +371,15 @@
       if (f) qs.set("from", f);
       if (to) qs.set("to", to);
 
-      try {
-        const data = await http(`${base}/transactions?${qs.toString()}`, { headers: hdrs() });
-        gridBody.innerHTML = "";
-        data.items.forEach(r => gridBody.appendChild(rowTx(r)));
-        updateKpis(data.items);
-        tip(`تم تحميل ${data.count} عملية`);
-      } catch (e) { tip(e.message); }
-    };
+      const data = await http(`${base}/transactions?${qs.toString()}`, { headers: hdrs() });
+      lastItems = data.items || [];
+      gridBody.innerHTML = "";
+      lastItems.forEach(r => gridBody.appendChild(rowTx(r)));
+      renderKpis(lastItems);
+      tip(`تم تحميل ${data.count} عملية`);
+    }
+
+    $("btnLoad").onclick = () => loadTx();
 
     $("btnCsv").onclick = async () => {
       if(!ensureWallet()) return;
@@ -439,6 +404,64 @@
       } catch (e) { tip(e.message); }
     };
 
+    // عمليات المحفظة
+    $("btnCreate").onclick = async () => {
+      try {
+        const data = await http(`${base}/wallet/create`, { method: "POST", headers: hdrs() });
+        $("walletId").value = data.wallet_id;
+        localStorage.setItem("walletId", data.wallet_id);
+        tip(`تم إنشاء محفظة: ${data.wallet_id}`);
+        await loadTx();
+      } catch (e) { tip(e.message); }
+    };
+
+    $("btnDeposit").onclick = async () => {
+      if(!ensureWallet() || !ensureAmount()) return;
+      try {
+        const data = await http(`${base}/wallet/deposit`, {
+          method: "POST", headers: hdrs(),
+          body: JSON.stringify({ wallet_id: wid(), amount: amt() })
+        });
+        tip(`الرصيد: ${fmtc(data.balance)}`);
+        await loadTx();
+      } catch (e) { tip(e.message); }
+    };
+
+    $("btnWithdraw").onclick = async () => {
+      if(!ensureWallet() || !ensureAmount()) return;
+      try {
+        const data = await http(`${base}/wallet/withdraw`, {
+          method: "POST", headers: hdrs(),
+          body: JSON.stringify({ wallet_id: wid(), amount: amt() })
+        });
+        tip(`الرصيد: ${fmtc(data.balance)}`);
+        await loadTx();
+      } catch (e) { tip(e.message); }
+    };
+
+    $("btnBalance").onclick = async () => {
+      if(!ensureWallet()) return;
+      try {
+        const url = `${base}/wallet/balance?wallet_id=${encodeURIComponent(wid())}`;
+        const data = await http(url, { headers: hdrs() });
+        tip(`الرصيد الحالي: ${fmtc(data.balance)}`);
+      } catch (e) { tip(e.message); }
+    };
+
+    $("btnTransfer").onclick = async () => {
+      if(!ensureWallet() || !ensureAmount()) return;
+      const to = $("toWallet").value.trim();
+      if(!to){ tip("أدخل To Wallet ID"); return }
+      try {
+        const data = await http(`${base}/wallet/transfer`, {
+          method: "POST", headers: hdrs(),
+          body: JSON.stringify({ from_wallet_id: wid(), to_wallet_id: to, amount: amt() })
+        });
+        tip(`تحويل ناجح: ${fmtc(data.amount)} → رصيدك: ${fmtc(data.from_balance)}`);
+        await loadTx();
+      } catch (e) { tip(e.message); }
+    };
+
     // Withdrawals
     $("btnWdCreate").onclick = async () => {
       if(!ensureWallet() || !ensureAmount()) return;
@@ -455,6 +478,7 @@
         });
         $("wdId").value = data.withdrawal_id;
         tip(`إنشاء طلب: ${data.withdrawal_id} (${data.status})`);
+        await loadTx();
       } catch (e) { tip(e.message); }
     };
 
@@ -468,7 +492,7 @@
           tr.innerHTML = `
             <td><code>${r.id}</code></td>
             <td><span class="pill out">withdraw(${r.status})</span></td>
-            <td>${Number(r.amount).toFixed(2)}</td>
+            <td>${fmtc(r.amount)}</td>
             <td>${r.created_at}</td>
             <td>${r.method} ${r.payment_reference ? "(" + r.payment_reference + ")" : ""}</td>`;
           gridBody.appendChild(tr);
@@ -487,9 +511,13 @@
         const data = await http(`${base}/withdrawal/mark_paid`, {
           method: "POST", headers: hdrs(), body: JSON.stringify(body)
         });
-        tip(`تم تعليم مدفوع: الرصيد الآن ${data.balance}`);
+        tip(`تم تعليم مدفوع: الرصيد الآن ${fmtc(data.balance)}`);
+        await loadTx();
       } catch (e) { tip(e.message); }
     };
+
+    // تحميل أولي للسجل إذا كان Wallet ID محفوظ
+    if(wid()){ loadTx(); }
   </script>
 </body>
 </html>
