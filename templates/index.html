@@ -1,54 +1,101 @@
 <!doctype html>
-<html lang="ar" dir="rtl">
+<html lang="ar" dir="rtl" data-theme="dark">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Nono Wallet - Dashboard (MVP)</title>
+  <title>Nono Wallet - Dashboard (Enhanced)</title>
   <style>
-    body { font-family: system-ui, -apple-system, Segoe UI, Tahoma, Arial; background:#0b1020; color:#f2f5ff; margin:0; }
-    .wrap { max-width: 1000px; margin: 24px auto; padding: 0 16px; }
-    h1 { font-size: 24px; margin: 0 0 16px; }
-    .card { background: #141b34; border: 1px solid #2a355f; border-radius: 14px; padding: 16px; margin-bottom: 16px; box-shadow: 0 4px 18px rgba(0,0,0,0.25);}
+    :root{
+      --bg:#0b1020; --card:#141b34; --border:#2a355f; --text:#f2f5ff; --muted:#9fb0ff;
+      --input:#0f1630; --brand:#1b6bff; --brand2:#2e77ff; --ok:#7ff0b2; --okbg:#0e4b2d; --bad:#ff99a6; --badbg:#4b0e17;
+    }
+    [data-theme="light"]{
+      --bg:#f7f9ff; --card:#ffffff; --border:#e5e9f6; --text:#0f1730; --muted:#5a6aa8;
+      --input:#f1f4ff; --brand:#2a66ff; --brand2:#1a59ff; --ok:#0f7a49; --okbg:#c8f5e2; --bad:#b01c38; --badbg:#ffd8df;
+    }
+    *{box-sizing:border-box}
+    body { font-family: system-ui, -apple-system, Segoe UI, Tahoma, Arial; background:var(--bg); color:var(--text); margin:0; }
+    .wrap { max-width: 1060px; margin: 24px auto; padding: 0 16px; }
+    h1 { font-size: 24px; margin: 0 0 16px; display:flex; align-items:center; gap:12px; }
+    .brand { width:28px; height:28px; border-radius:6px; background:linear-gradient(135deg, var(--brand), var(--brand2)); display:inline-block }
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 16px; margin-bottom: 16px; box-shadow: 0 4px 18px rgba(0,0,0,0.12);}
     .row { display: grid; grid-template-columns: repeat(auto-fit,minmax(220px,1fr)); gap: 12px; }
-    label { font-size: 13px; color:#b6c2ff; display:block; margin-bottom: 6px; }
+    label { font-size: 13px; color:var(--muted); display:block; margin-bottom: 6px; }
     input, select, button, textarea {
-      width: 100%; padding: 10px 12px; border-radius: 10px; border: 1px solid #2a355f;
-      background:#0f1630; color:#fff; outline: none;
+      width: 100%; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border);
+      background:var(--input); color:var(--text); outline: none;
     }
     input::placeholder, textarea::placeholder { color:#92a0d1; }
     button { cursor: pointer; font-weight: 600; }
-    .btn { background: #1b6bff; border: 1px solid #2e77ff; }
+    .btn { background: var(--brand); border: 1px solid var(--brand2); color:#fff; }
+    .btn.secondary{ background:transparent }
     .btn:disabled { opacity: .6; cursor: not-allowed; }
-    .muted { color:#9fb0ff; font-size: 12px; }
+    .muted { color:var(--muted); font-size: 12px; }
     table { width: 100%; border-collapse: collapse; margin-top: 8px; }
-    th, td { border-bottom: 1px solid #2a355f; padding: 8px; font-size: 13px; text-align: right; }
-    th { color:#b6c2ff; font-weight: 600; background:#0f1630; position: sticky; top: 0; }
+    th, td { border-bottom: 1px solid var(--border); padding: 8px; font-size: 13px; text-align: right; }
+    th { color:var(--muted); font-weight: 600; position: sticky; top: 0; background: var(--input); }
     .pill { display:inline-block; padding:4px 8px; border-radius: 999px; font-size:12px; }
-    .pill.in { background:#0e4b2d; color:#7ff0b2; }
-    .pill.out { background:#4b0e17; color:#ff99a6; }
+    .pill.in { background:var(--okbg); color:var(--ok); }
+    .pill.out { background:var(--badbg); color:var(--bad); }
     .flex { display:flex; gap:8px; flex-wrap: wrap; align-items:center; }
     .space { height: 6px; }
     .foot { margin-top: 10px; display:flex; justify-content: space-between; align-items:center; }
     a.link { color:#7fb3ff; text-decoration: none; }
+    .iconbtn{display:inline-flex; align-items:center; gap:6px}
+    .mini{padding:8px 10px; font-size:12px}
+    .copy-wrap{display:flex; gap:8px}
+    .kpis{display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:10px}
+    .kpi{background:var(--input); border:1px solid var(--border); border-radius:12px; padding:12px}
+    .kpi h3{margin:0 0 6px; font-size:13px; color:var(--muted)}
+    .kpi .v{font-size:20px; font-weight:700}
+    .topbar{display:flex; justify-content:space-between; align-items:center; margin-bottom:8px}
+    .switch{border:1px solid var(--border); border-radius:10px; padding:8px 12px; background:var(--input)}
+    /* Toast */
+    .toast{position:fixed; bottom:24px; left:50%; transform:translateX(-50%); background:#111a; color:#fff; padding:10px 14px; border-radius:10px; backdrop-filter: blur(8px); opacity:0; pointer-events:none; transition:opacity .2s}
+    .toast.show{opacity:1}
+    /* Spinner overlay */
+    .spinner{position:fixed; inset:0; background:#0004; display:none; align-items:center; justify-content:center; z-index:999}
+    .spinner.show{display:flex}
+    .spin{width:36px; height:36px; border-radius:50%; border:4px solid #fff6; border-top-color:#fff; animation:sp 1s linear infinite}
+    @keyframes sp{to{transform:rotate(360deg)}}
   </style>
 </head>
 <body>
   <div class="wrap">
-    <h1>لوحة نونو وِلت (MVP)</h1>
+    <div class="topbar">
+      <h1><span class="brand"></span> لوحة نونو وِلت (MVP)</h1>
+      <button id="themeBtn" class="switch">تبديل السمة (فاتح/داكن)</button>
+    </div>
+
+    <!-- KPIs -->
+    <div class="card">
+      <div class="kpis">
+        <div class="kpi"><h3>إجمالي الإيداعات</h3><div class="v" id="kDeposit">0.00</div></div>
+        <div class="kpi"><h3>إجمالي السحوبات</h3><div class="v" id="kWithdraw">0.00</div></div>
+        <div class="kpi"><h3>صافي التدفق</h3><div class="v" id="kNet">0.00</div></div>
+      </div>
+      <div class="muted">يُحدَّث عند “تحميل السجل”.</div>
+    </div>
 
     <div class="card">
       <div class="row">
         <div>
           <label>API Token (الهيدر X-Api-Key)</label>
-          <input id="apiKey" placeholder="ادخل مفتاح API" />
+          <div class="copy-wrap">
+            <input id="apiKey" placeholder="ادخل مفتاح API" />
+            <button class="mini" id="copyApi">نسخ</button>
+          </div>
           <div class="muted">يُحفَظ محليًا في المتصفح (localStorage)</div>
         </div>
         <div>
           <label>Wallet ID (معرّف المحفظة)</label>
-          <input id="walletId" placeholder="UUID لمحفظتك" />
-          <div class="flex">
+          <div class="copy-wrap">
+            <input id="walletId" placeholder="UUID لمحفظتك" />
+            <button class="mini" id="copyWallet">نسخ</button>
+          </div>
+          <div class="flex" style="margin-top:6px">
             <button class="btn" id="btnCreate">إنشاء محفظة</button>
-            <button id="btnSaveIds">حفظ</button>
+            <button class="secondary" id="btnSaveIds">حفظ</button>
           </div>
         </div>
       </div>
@@ -59,6 +106,7 @@
         <div>
           <label>مبلغ</label>
           <input id="amount" type="number" step="0.01" placeholder="مثال: 200" />
+          <div class="muted">يجب أن يكون &gt; 0</div>
         </div>
         <div>
           <label>عمليات على المحفظة</label>
@@ -69,7 +117,10 @@
           </div>
           <div class="space"></div>
           <label>تحويل إلى محفظة أخرى</label>
-          <input id="toWallet" placeholder="To Wallet ID" />
+          <div class="copy-wrap">
+            <input id="toWallet" placeholder="To Wallet ID" />
+            <button class="mini" id="copyToWallet">نسخ</button>
+          </div>
           <div class="space"></div>
           <button id="btnTransfer">تحويل</button>
         </div>
@@ -139,7 +190,10 @@
         </div>
         <div>
           <label>اسم المستفيد</label>
-          <input id="wdName" placeholder="الاسم الكامل" />
+          <div class="copy-wrap">
+            <input id="wdName" placeholder="الاسم الكامل" />
+            <button class="mini" id="copyWdName">نسخ</button>
+          </div>
         </div>
         <div>
           <label>تفاصيل/فرع/ملاحظة</label>
@@ -155,7 +209,10 @@
       <div class="row">
         <div>
           <label>Withdrawal ID</label>
-          <input id="wdId" placeholder="معرّف طلب السحب" />
+          <div class="copy-wrap">
+            <input id="wdId" placeholder="معرّف طلب السحب" />
+            <button class="mini" id="copyWdId">نسخ</button>
+          </div>
         </div>
         <div>
           <label>Payment Reference</label>
@@ -170,40 +227,75 @@
     <div class="muted">© Nono Wallet MVP</div>
   </div>
 
+  <!-- Toast + Spinner -->
+  <div class="toast" id="toast">تم</div>
+  <div class="spinner" id="spinner"><div class="spin"></div></div>
+
   <script>
     const base = window.location.origin;
     const $ = (id) => document.getElementById(id);
     const statusEl = $("status");
     const gridBody = $("grid").querySelector("tbody");
+    const toast = $("toast");
+    const spinner = $("spinner");
 
-    // حفظ/تحميل API key & wallet id محليًا
+    // استعادة قيم محلية
     (function restore() {
-      const k = localStorage.getItem("apiKey") || "";
-      $("apiKey").value = k;
-      const w = localStorage.getItem("walletId") || "";
-      $("walletId").value = w;
+      $("apiKey").value = localStorage.getItem("apiKey") || "";
+      $("walletId").value = localStorage.getItem("walletId") || "";
+      document.documentElement.dataset.theme = localStorage.getItem("theme") || "dark";
     })();
+
+    // تبديل السمة
+    $("themeBtn").onclick = () => {
+      const cur = document.documentElement.dataset.theme;
+      const next = cur === "dark" ? "light" : "dark";
+      document.documentElement.dataset.theme = next;
+      localStorage.setItem("theme", next);
+      tip(`تم التبديل إلى سمة ${next === "dark" ? "داكنة" : "فاتحة"}`);
+    };
 
     $("btnSaveIds").onclick = () => {
       localStorage.setItem("apiKey", $("apiKey").value.trim());
       localStorage.setItem("walletId", $("walletId").value.trim());
-      note("تم الحفظ محليًا");
+      tip("تم الحفظ محليًا");
     };
 
+    // نسخ
+    function copy(elId){
+      const v = $(elId).value.trim();
+      if(!v) return tip("لا يوجد نص للنسخ");
+      navigator.clipboard.writeText(v).then(()=> tip("تم النسخ")).catch(()=> tip("تعذّر النسخ"));
+    }
+    $("copyApi").onclick = ()=>copy("apiKey");
+    $("copyWallet").onclick = ()=>copy("walletId");
+    $("copyToWallet").onclick = ()=>copy("toWallet");
+    $("copyWdName").onclick = ()=>copy("wdName");
+    $("copyWdId").onclick = ()=>copy("wdId");
+
+    // Helpers
     function hdrs() {
       const k = $("apiKey").value.trim();
       return { "Content-Type": "application/json", "X-Api-Key": k };
     }
-    function wid() { return $("walletId").value.trim(); }
-    function amt() { return Number($("amount").value); }
-    function note(msg) { statusEl.textContent = msg; }
+    const wid = () => $("walletId").value.trim();
+    const amt = () => Number($("amount").value);
+    const note = (msg) => statusEl.textContent = msg;
+    const showSpin = (b)=> spinner.classList.toggle("show", b);
+    let toastTimer=null;
+    function tip(msg){
+      toast.textContent=msg; toast.classList.add("show");
+      if(toastTimer) clearTimeout(toastTimer);
+      toastTimer=setTimeout(()=> toast.classList.remove("show"), 1800);
+      note(msg);
+    }
 
     function rowTx(r) {
       const tr = document.createElement("tr");
       tr.innerHTML = `
         <td><code>${r.id}</code></td>
         <td>${pill(r.type)}</td>
-        <td>${r.amount.toFixed ? r.amount.toFixed(2) : r.amount}</td>
+        <td>${Number(r.amount).toFixed(2)}</td>
         <td>${r.created_at}</td>
         <td>${r.counterparty_wallet_id || ""}</td>`;
       return tr;
@@ -214,65 +306,99 @@
     }
 
     async function http(url, opts={}) {
-      const res = await fetch(url, opts);
-      if (!res.ok) {
-        const t = await res.text().catch(()=> "");
-        throw new Error(`HTTP ${res.status}: ${t}`);
+      showSpin(true);
+      try{
+        const res = await fetch(url, opts);
+        if (!res.ok) {
+          const t = await res.text().catch(()=> "");
+          throw new Error(`HTTP ${res.status}: ${t}`);
+        }
+        const ct = res.headers.get("content-type") || "";
+        if (ct.includes("application/json")) return res.json();
+        return res.blob();
+      } finally {
+        showSpin(false);
       }
-      const ct = res.headers.get("content-type") || "";
-      if (ct.includes("application/json")) return res.json();
-      return res.blob();
     }
 
+    // تحقق بسيط
+    function ensureWallet(){ if(!wid()){ tip("أدخل Wallet ID"); return false } return true }
+    function ensureAmount(){
+      const a = amt();
+      if(!(a>0)){ tip("المبلغ يجب أن يكون أكبر من 0"); return false }
+      return true;
+    }
+
+    // أزرار
     $("btnCreate").onclick = async () => {
       try {
         const data = await http(`${base}/wallet/create`, { method: "POST", headers: hdrs() });
         $("walletId").value = data.wallet_id;
         localStorage.setItem("walletId", data.wallet_id);
-        note(`تم إنشاء محفظة: ${data.wallet_id}`);
-      } catch (e) { note(e.message); }
+        tip(`تم إنشاء محفظة: ${data.wallet_id}`);
+      } catch (e) { tip(e.message); }
     };
 
     $("btnDeposit").onclick = async () => {
+      if(!ensureWallet() || !ensureAmount()) return;
       try {
         const data = await http(`${base}/wallet/deposit`, {
           method: "POST", headers: hdrs(),
           body: JSON.stringify({ wallet_id: wid(), amount: amt() })
         });
-        note(`الرصيد: ${data.balance}`);
-      } catch (e) { note(e.message); }
+        tip(`الرصيد: ${data.balance}`);
+      } catch (e) { tip(e.message); }
     };
 
     $("btnWithdraw").onclick = async () => {
+      if(!ensureWallet() || !ensureAmount()) return;
       try {
         const data = await http(`${base}/wallet/withdraw`, {
           method: "POST", headers: hdrs(),
           body: JSON.stringify({ wallet_id: wid(), amount: amt() })
         });
-        note(`الرصيد: ${data.balance}`);
-      } catch (e) { note(e.message); }
+        tip(`الرصيد: ${data.balance}`);
+      } catch (e) { tip(e.message); }
     };
 
     $("btnBalance").onclick = async () => {
+      if(!ensureWallet()) return;
       try {
         const url = `${base}/wallet/balance?wallet_id=${encodeURIComponent(wid())}`;
         const data = await http(url, { headers: hdrs() });
-        note(`الرصيد الحالي: ${data.balance}`);
-      } catch (e) { note(e.message); }
+        tip(`الرصيد الحالي: ${data.balance}`);
+      } catch (e) { tip(e.message); }
     };
 
     $("btnTransfer").onclick = async () => {
+      if(!ensureWallet() || !ensureAmount()) return;
       const to = $("toWallet").value.trim();
+      if(!to){ tip("أدخل To Wallet ID"); return }
       try {
         const data = await http(`${base}/wallet/transfer`, {
           method: "POST", headers: hdrs(),
           body: JSON.stringify({ from_wallet_id: wid(), to_wallet_id: to, amount: amt() })
         });
-        note(`تحويل ناجح: ${data.amount} → رصيدك: ${data.from_balance}`);
-      } catch (e) { note(e.message); }
+        tip(`تحويل ناجح: ${data.amount} → رصيدك: ${data.from_balance}`);
+      } catch (e) { tip(e.message); }
     };
 
+    // حساب KPIs من السجل
+    function updateKpis(items){
+      let dep=0, wd=0;
+      for(const r of items){
+        const a = Number(r.amount)||0;
+        if(r.type==="deposit" || r.type==="transfer_in") dep += a;
+        if(r.type==="withdraw" || r.type==="transfer_out") wd  += a;
+      }
+      const net = dep - wd;
+      $("kDeposit").textContent = dep.toFixed(2);
+      $("kWithdraw").textContent = wd.toFixed(2);
+      $("kNet").textContent = net.toFixed(2);
+    }
+
     $("btnLoad").onclick = async () => {
+      if(!ensureWallet()) return;
       const t = $("type").value.trim();
       const f = $("from").value.trim();
       const to = $("to").value.trim();
@@ -285,11 +411,13 @@
         const data = await http(`${base}/transactions?${qs.toString()}`, { headers: hdrs() });
         gridBody.innerHTML = "";
         data.items.forEach(r => gridBody.appendChild(rowTx(r)));
-        note(`تم تحميل ${data.count} عملية`);
-      } catch (e) { note(e.message); }
+        updateKpis(data.items);
+        tip(`تم تحميل ${data.count} عملية`);
+      } catch (e) { tip(e.message); }
     };
 
     $("btnCsv").onclick = async () => {
+      if(!ensureWallet()) return;
       const t = $("type").value.trim();
       const f = $("from").value.trim();
       const to = $("to").value.trim();
@@ -307,12 +435,13 @@
         a.click();
         a.remove();
         URL.revokeObjectURL(url);
-        note("تم تنزيل CSV");
-      } catch (e) { note(e.message); }
+        tip("تم تنزيل CSV");
+      } catch (e) { tip(e.message); }
     };
 
     // Withdrawals
     $("btnWdCreate").onclick = async () => {
+      if(!ensureWallet() || !ensureAmount()) return;
       try {
         const body = {
           wallet_id: wid(),
@@ -325,14 +454,14 @@
           method: "POST", headers: hdrs(), body: JSON.stringify(body)
         });
         $("wdId").value = data.withdrawal_id;
-        note(`إنشاء طلب: ${data.withdrawal_id} (${data.status})`);
-      } catch (e) { note(e.message); }
+        tip(`إنشاء طلب: ${data.withdrawal_id} (${data.status})`);
+      } catch (e) { tip(e.message); }
     };
 
     $("btnWdList").onclick = async () => {
+      if(!ensureWallet()) return;
       try {
         const data = await http(`${base}/withdrawal/list?wallet_id=${encodeURIComponent(wid())}`, { headers: hdrs() });
-        // عرض السجل بالجدول نفسه (مع نوع "withdraw")
         gridBody.innerHTML = "";
         data.items.forEach(r => {
           const tr = document.createElement("tr");
@@ -344,11 +473,12 @@
             <td>${r.method} ${r.payment_reference ? "(" + r.payment_reference + ")" : ""}</td>`;
           gridBody.appendChild(tr);
         });
-        note(`طلبات: ${data.count}`);
-      } catch (e) { note(e.message); }
+        tip(`طلبات: ${data.count}`);
+      } catch (e) { tip(e.message); }
     };
 
     $("btnWdPaid").onclick = async () => {
+      if(!$("wdId").value.trim()){ tip("أدخل Withdrawal ID"); return }
       try {
         const body = {
           withdrawal_id: $("wdId").value.trim(),
@@ -357,10 +487,9 @@
         const data = await http(`${base}/withdrawal/mark_paid`, {
           method: "POST", headers: hdrs(), body: JSON.stringify(body)
         });
-        note(`تم تعليم مدفوع: الرصيد الآن ${data.balance}`);
-      } catch (e) { note(e.message); }
+        tip(`تم تعليم مدفوع: الرصيد الآن ${data.balance}`);
+      } catch (e) { tip(e.message); }
     };
   </script>
 </body>
 </html>
-
