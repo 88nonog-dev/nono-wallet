@@ -7,7 +7,8 @@ import csv
 from io import StringIO
 
 from sqlalchemy import (
-    create_engine, String, Numeric, DateTime, Enum, ForeignKey, select, desc, and_
+    create_engine, String, Numeric, DateTime, Enum, ForeignKey, Text,
+    select, desc, and_
 )
 from sqlalchemy.orm import (
     sessionmaker, DeclarativeBase, Mapped, mapped_column, relationship
@@ -61,26 +62,52 @@ class Transaction(Base):
 
     wallet: Mapped[Wallet] = relationship(back_populates="transactions")
 
+# --- Withdrawals ---
+class WDStatus:
+    PENDING = "pending"
+    PAID = "paid"
+    CANCELED = "canceled"
+
+ALLOWED_WD_STATUS = {WDStatus.PENDING, WDStatus.PAID, WDStatus.CANCELED}
+
+class WithdrawalRequest(Base):
+    __tablename__ = "withdrawal_requests"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    wallet_id: Mapped[str] = mapped_column(String(64), ForeignKey("wallets.id"), index=True)
+    amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
+    method: Mapped[str] = mapped_column(String(32), nullable=False, default="western_union")
+    beneficiary_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    last4: Mapped[str | None] = mapped_column(String(8), nullable=True)  # لبطاقة/معرّف جزئي
+    details: Mapped[str | None] = mapped_column(Text, nullable=True)     # مدينة/ملاحظات
+    status: Mapped[str] = mapped_column(
+        Enum(WDStatus.PENDING, WDStatus.PAID, WDStatus.CANCELED, name="wd_status_enum"),
+        default=WDStatus.PENDING, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True, nullable=False)
+    paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    tx_id: Mapped[str | None] = mapped_column(String(64), nullable=True)  # معاملة السحب عند الدفع
+    payment_reference: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
 Base.metadata.create_all(bind=engine)
 
 # =========================
 # Flask App
 # =========================
 app = Flask(__name__)
+
 # 🔐 API Key protection
 API_TOKEN = os.getenv("API_TOKEN", "")
 
 @app.before_request
 def require_api_key():
-    # مسارات مسموحة بدون مفتاح
+    # مسارات مفتوحة بدون مفتاح
     open_paths = {"/health", "/whoami"}
     if request.path in open_paths:
         return
-
-    # التحقق من المفتاح
     key = request.headers.get("X-Api-Key", "")
     if not API_TOKEN or key != API_TOKEN:
         return jsonify(ok=False, error="unauthorized"), 401
+
 # ---- helpers ----
 def d(val) -> Decimal:
     """Normalize to Decimal(2dp)."""
@@ -387,6 +414,150 @@ def export_transactions_csv():
         filename = f"transactions_{wallet_id}.csv"
         headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
         return Response(csv_data, mimetype="text/csv", headers=headers)
+    finally:
+        db.close()
+
+# =========================
+# Withdrawals: create / list / mark_paid
+# =========================
+@app.post("/withdrawal/create")
+def withdrawal_create():
+    data = request.get_json(silent=True) or {}
+    wallet_id = data.get("wallet_id", "")
+    amount = data.get("amount", None)
+    method = (data.get("method") or "western_union").strip().lower()
+    beneficiary_name = data.get("beneficiary_name")
+    last4 = data.get("last4")
+    details = data.get("details")
+
+    if not wallet_id:
+        return jsonify(ok=False, error="wallet_id_required"), 400
+    try:
+        amount = d(amount)
+    except (TypeError, InvalidOperation):
+        return jsonify(ok=False, error="invalid_amount"), 400
+    if amount <= 0:
+        return jsonify(ok=False, error="amount_must_be_positive"), 400
+
+    db = SessionLocal()
+    try:
+        w = db.get(Wallet, wallet_id)
+        if not w:
+            return jsonify(ok=False, error="wallet_not_found"), 404
+
+        wd = WithdrawalRequest(
+            id=str(uuid.uuid4()),
+            wallet_id=wallet_id,
+            amount=amount,
+            method=method,
+            beneficiary_name=beneficiary_name,
+            last4=last4,
+            details=details,
+            status=WDStatus.PENDING,
+            created_at=now_utc(),
+        )
+        db.add(wd)
+        db.commit()
+        return jsonify(ok=True, withdrawal_id=wd.id, status=wd.status, amount=float(amount), method=method)
+    finally:
+        db.close()
+
+@app.get("/withdrawal/list")
+def withdrawal_list():
+    wallet_id = request.args.get("wallet_id", "")
+    status_filter = request.args.get("status", "").strip().lower()
+    limit = request.args.get("limit", "50")
+    offset = request.args.get("offset", "0")
+
+    if not wallet_id:
+        return jsonify(ok=False, error="wallet_id_required"), 400
+    if status_filter and status_filter not in ALLOWED_WD_STATUS:
+        return jsonify(ok=False, error="invalid_status"), 400
+
+    try:
+        limit_i = max(1, min(200, int(limit)))
+        offset_i = max(0, int(offset))
+    except ValueError:
+        return jsonify(ok=False, error="invalid_pagination"), 400
+
+    db = SessionLocal()
+    try:
+        if not db.get(Wallet, wallet_id):
+            return jsonify(ok=False, error="wallet_not_found"), 404
+
+        conds = [WithdrawalRequest.wallet_id == wallet_id]
+        if status_filter:
+            conds.append(WithdrawalRequest.status == status_filter)
+
+        stmt = (
+            select(WithdrawalRequest)
+            .where(and_(*conds))
+            .order_by(desc(WithdrawalRequest.created_at))
+            .limit(limit_i)
+            .offset(offset_i)
+        )
+        rows = db.execute(stmt).scalars().all()
+        items = [{
+            "id": r.id,
+            "wallet_id": r.wallet_id,
+            "amount": float(r.amount),
+            "method": r.method,
+            "beneficiary_name": r.beneficiary_name,
+            "last4": r.last4,
+            "details": r.details,
+            "status": r.status,
+            "created_at": r.created_at.isoformat(),
+            "paid_at": r.paid_at.isoformat() if r.paid_at else None,
+            "tx_id": r.tx_id,
+            "payment_reference": r.payment_reference,
+        } for r in rows]
+        return jsonify(ok=True, wallet_id=wallet_id, count=len(items), items=items)
+    finally:
+        db.close()
+
+@app.post("/withdrawal/mark_paid")
+def withdrawal_mark_paid():
+    data = request.get_json(silent=True) or {}
+    withdrawal_id = data.get("withdrawal_id", "")
+    payment_reference = data.get("payment_reference")  # رقم وصل/مرجع خارجي اختياري
+
+    if not withdrawal_id:
+        return jsonify(ok=False, error="withdrawal_id_required"), 400
+
+    db = SessionLocal()
+    try:
+        wd = db.get(WithdrawalRequest, withdrawal_id)
+        if not wd:
+            return jsonify(ok=False, error="withdrawal_not_found"), 404
+        if wd.status == WDStatus.PAID:
+            return jsonify(ok=False, error="already_paid", tx_id=wd.tx_id), 409
+
+        w = db.get(Wallet, wd.wallet_id)
+        if not w:
+            return jsonify(ok=False, error="wallet_not_found"), 404
+
+        # عند الدفع: نخصم الرصيد ونضيف معاملة سحب
+        if w.balance < wd.amount:
+            return jsonify(ok=False, error="insufficient_funds"), 400
+
+        w.balance = d(w.balance - wd.amount)
+        tx = add_tx(db, w.id, TxType.WITHDRAW, wd.amount)
+        wd.status = WDStatus.PAID
+        wd.paid_at = now_utc()
+        wd.tx_id = tx.id
+        wd.payment_reference = payment_reference
+
+        db.commit()
+        return jsonify(
+            ok=True,
+            withdrawal_id=wd.id,
+            status=wd.status,
+            tx_id=wd.tx_id,
+            payment_reference=wd.payment_reference,
+            wallet_id=w.id,
+            balance=float(w.balance),
+            amount=float(wd.amount),
+        )
     finally:
         db.close()
 
