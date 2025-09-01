@@ -67,7 +67,20 @@ Base.metadata.create_all(bind=engine)
 # Flask App
 # =========================
 app = Flask(__name__)
+# 🔐 API Key protection
+API_TOKEN = os.getenv("API_TOKEN", "")
 
+@app.before_request
+def require_api_key():
+    # مسارات مسموحة بدون مفتاح
+    open_paths = {"/health", "/whoami"}
+    if request.path in open_paths:
+        return
+
+    # التحقق من المفتاح
+    key = request.headers.get("X-Api-Key", "")
+    if not API_TOKEN or key != API_TOKEN:
+        return jsonify(ok=False, error="unauthorized"), 401
 # ---- helpers ----
 def d(val) -> Decimal:
     """Normalize to Decimal(2dp)."""
