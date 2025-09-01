@@ -5,9 +5,8 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import datetime, timezone
 
 from sqlalchemy import (
-    create_engine, String, Numeric, DateTime, Enum, ForeignKey, select, desc
+    create_engine, String, Numeric, DateTime, Enum, ForeignKey, select, desc, and_
 )
-    # ملاحظة: لا تخاف من Enum من SQLAlchemy، هو ينشئ النوع بالـ DB أول مرة
 from sqlalchemy.orm import (
     sessionmaker, DeclarativeBase, Mapped, mapped_column, relationship
 )
@@ -42,6 +41,10 @@ class TxType:
     TRANSFER_IN = "transfer_in"
     TRANSFER_OUT = "transfer_out"
 
+ALLOWED_TYPES = {
+    TxType.DEPOSIT, TxType.WITHDRAW, TxType.TRANSFER_IN, TxType.TRANSFER_OUT
+}
+
 class Transaction(Base):
     __tablename__ = "transactions"
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -73,6 +76,22 @@ def d(val) -> Decimal:
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
+
+def parse_iso8601(s: str | None) -> datetime | None:
+    """Parse ISO8601; supports trailing 'Z'."""
+    if not s:
+        return None
+    s = s.strip()
+    try:
+        if s.endswith("Z"):
+            s = s.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        # ensure timezone-aware; assume UTC if naive
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
 
 def add_tx(db, wallet_id: str, tx_type: str, amount: Decimal, counterparty: str | None = None):
     tx = Transaction(
@@ -234,13 +253,16 @@ def wallet_transfer():
         db.close()
 
 # =========================
-# Transactions listing
+# Transactions listing (with filters)
 # =========================
 @app.get("/transactions")
 def list_transactions():
     wallet_id = request.args.get("wallet_id", "")
     limit = request.args.get("limit", "50")
     offset = request.args.get("offset", "0")
+    type_filter = request.args.get("type", "").strip().lower()
+    from_s = request.args.get("from", "")
+    to_s = request.args.get("to", "")
 
     if not wallet_id:
         return jsonify(ok=False, error="wallet_id_required"), 400
@@ -251,14 +273,34 @@ def list_transactions():
     except ValueError:
         return jsonify(ok=False, error="invalid_pagination"), 400
 
+    # validate type filter if provided
+    if type_filter and type_filter not in ALLOWED_TYPES:
+        return jsonify(ok=False, error="invalid_type_filter"), 400
+
+    dt_from = parse_iso8601(from_s) if from_s else None
+    dt_to = parse_iso8601(to_s) if to_s else None
+    if from_s and not dt_from:
+        return jsonify(ok=False, error="invalid_from_datetime"), 400
+    if to_s and not dt_to:
+        return jsonify(ok=False, error="invalid_to_datetime"), 400
+
     db = SessionLocal()
     try:
+        # Ensure wallet exists
         if not db.get(Wallet, wallet_id):
             return jsonify(ok=False, error="wallet_not_found"), 404
 
+        conds = [Transaction.wallet_id == wallet_id]
+        if type_filter:
+            conds.append(Transaction.type == type_filter)
+        if dt_from:
+            conds.append(Transaction.created_at >= dt_from)
+        if dt_to:
+            conds.append(Transaction.created_at <= dt_to)
+
         stmt = (
             select(Transaction)
-            .where(Transaction.wallet_id == wallet_id)
+            .where(and_(*conds))
             .order_by(desc(Transaction.created_at))
             .limit(limit_i)
             .offset(offset_i)
