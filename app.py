@@ -1,8 +1,10 @@
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, Response
 import os
 import uuid
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import datetime, timezone
+import csv
+from io import StringIO
 
 from sqlalchemy import (
     create_engine, String, Numeric, DateTime, Enum, ForeignKey, select, desc, and_
@@ -66,6 +68,7 @@ Base.metadata.create_all(bind=engine)
 # =========================
 app = Flask(__name__)
 
+# ---- helpers ----
 def d(val) -> Decimal:
     """Normalize to Decimal(2dp)."""
     if isinstance(val, Decimal):
@@ -86,7 +89,6 @@ def parse_iso8601(s: str | None) -> datetime | None:
         if s.endswith("Z"):
             s = s.replace("Z", "+00:00")
         dt = datetime.fromisoformat(s)
-        # ensure timezone-aware; assume UTC if naive
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt
@@ -120,7 +122,7 @@ def whoami():
     return jsonify(ok=True, token=token)
 
 # =========================
-# Wallet Endpoints (Persistent via DB)
+# Wallet Endpoints
 # =========================
 @app.post("/wallet/create")
 def create_wallet():
@@ -139,7 +141,6 @@ def wallet_balance():
     wallet_id = request.args.get("wallet_id", "")
     if not wallet_id:
         return jsonify(ok=False, error="wallet_id_required"), 400
-
     db = SessionLocal()
     try:
         w = db.get(Wallet, wallet_id)
@@ -154,7 +155,6 @@ def wallet_deposit():
     data = request.get_json(silent=True) or {}
     wallet_id = data.get("wallet_id", "")
     amount = data.get("amount", None)
-
     if not wallet_id:
         return jsonify(ok=False, error="wallet_id_required"), 400
     try:
@@ -181,7 +181,6 @@ def wallet_withdraw():
     data = request.get_json(silent=True) or {}
     wallet_id = data.get("wallet_id", "")
     amount = data.get("amount", None)
-
     if not wallet_id:
         return jsonify(ok=False, error="wallet_id_required"), 400
     try:
@@ -211,7 +210,6 @@ def wallet_transfer():
     from_id = data.get("from_wallet_id", "")
     to_id = data.get("to_wallet_id", "")
     amount = data.get("amount", None)
-
     if not from_id or not to_id:
         return jsonify(ok=False, error="wallet_ids_required"), 400
     if from_id == to_id:
@@ -253,7 +251,7 @@ def wallet_transfer():
         db.close()
 
 # =========================
-# Transactions listing (with filters)
+# Transactions: list + filters
 # =========================
 @app.get("/transactions")
 def list_transactions():
@@ -273,7 +271,6 @@ def list_transactions():
     except ValueError:
         return jsonify(ok=False, error="invalid_pagination"), 400
 
-    # validate type filter if provided
     if type_filter and type_filter not in ALLOWED_TYPES:
         return jsonify(ok=False, error="invalid_type_filter"), 400
 
@@ -286,7 +283,6 @@ def list_transactions():
 
     db = SessionLocal()
     try:
-        # Ensure wallet exists
         if not db.get(Wallet, wallet_id):
             return jsonify(ok=False, error="wallet_not_found"), 404
 
@@ -315,6 +311,69 @@ def list_transactions():
             "counterparty_wallet_id": r.counterparty_wallet_id,
         } for r in rows]
         return jsonify(ok=True, wallet_id=wallet_id, count=len(items), items=items)
+    finally:
+        db.close()
+
+# =========================
+# Transactions: export CSV
+# =========================
+@app.get("/transactions/export.csv")
+def export_transactions_csv():
+    wallet_id = request.args.get("wallet_id", "")
+    type_filter = request.args.get("type", "").strip().lower()
+    from_s = request.args.get("from", "")
+    to_s = request.args.get("to", "")
+
+    if not wallet_id:
+        return jsonify(ok=False, error="wallet_id_required"), 400
+    if type_filter and type_filter not in ALLOWED_TYPES:
+        return jsonify(ok=False, error="invalid_type_filter"), 400
+
+    dt_from = parse_iso8601(from_s) if from_s else None
+    dt_to = parse_iso8601(to_s) if to_s else None
+    if from_s and not dt_from:
+        return jsonify(ok=False, error="invalid_from_datetime"), 400
+    if to_s and not dt_to:
+        return jsonify(ok=False, error="invalid_to_datetime"), 400
+
+    db = SessionLocal()
+    try:
+        if not db.get(Wallet, wallet_id):
+            return jsonify(ok=False, error="wallet_not_found"), 404
+
+        conds = [Transaction.wallet_id == wallet_id]
+        if type_filter:
+            conds.append(Transaction.type == type_filter)
+        if dt_from:
+            conds.append(Transaction.created_at >= dt_from)
+        if dt_to:
+            conds.append(Transaction.created_at <= dt_to)
+
+        stmt = (
+            select(Transaction)
+            .where(and_(*conds))
+            .order_by(desc(Transaction.created_at))
+        )
+        rows = db.execute(stmt).scalars().all()
+
+        buf = StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(["id", "wallet_id", "type", "amount", "created_at", "counterparty_wallet_id"])
+        for r in rows:
+            writer.writerow([
+                r.id,
+                r.wallet_id,
+                r.type,
+                f"{float(r.amount):.2f}",
+                r.created_at.isoformat(),
+                r.counterparty_wallet_id or "",
+            ])
+        csv_data = buf.getvalue()
+        buf.close()
+
+        filename = f"transactions_{wallet_id}.csv"
+        headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+        return Response(csv_data, mimetype="text/csv", headers=headers)
     finally:
         db.close()
 
