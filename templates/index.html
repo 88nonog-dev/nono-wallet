@@ -1,1 +1,366 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Nono Wallet - Dashboard (MVP)</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Tahoma, Arial; background:#0b1020; color:#f2f5ff; margin:0; }
+    .wrap { max-width: 1000px; margin: 24px auto; padding: 0 16px; }
+    h1 { font-size: 24px; margin: 0 0 16px; }
+    .card { background: #141b34; border: 1px solid #2a355f; border-radius: 14px; padding: 16px; margin-bottom: 16px; box-shadow: 0 4px 18px rgba(0,0,0,0.25);}
+    .row { display: grid; grid-template-columns: repeat(auto-fit,minmax(220px,1fr)); gap: 12px; }
+    label { font-size: 13px; color:#b6c2ff; display:block; margin-bottom: 6px; }
+    input, select, button, textarea {
+      width: 100%; padding: 10px 12px; border-radius: 10px; border: 1px solid #2a355f;
+      background:#0f1630; color:#fff; outline: none;
+    }
+    input::placeholder, textarea::placeholder { color:#92a0d1; }
+    button { cursor: pointer; font-weight: 600; }
+    .btn { background: #1b6bff; border: 1px solid #2e77ff; }
+    .btn:disabled { opacity: .6; cursor: not-allowed; }
+    .muted { color:#9fb0ff; font-size: 12px; }
+    table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+    th, td { border-bottom: 1px solid #2a355f; padding: 8px; font-size: 13px; text-align: right; }
+    th { color:#b6c2ff; font-weight: 600; background:#0f1630; position: sticky; top: 0; }
+    .pill { display:inline-block; padding:4px 8px; border-radius: 999px; font-size:12px; }
+    .pill.in { background:#0e4b2d; color:#7ff0b2; }
+    .pill.out { background:#4b0e17; color:#ff99a6; }
+    .flex { display:flex; gap:8px; flex-wrap: wrap; align-items:center; }
+    .space { height: 6px; }
+    .foot { margin-top: 10px; display:flex; justify-content: space-between; align-items:center; }
+    a.link { color:#7fb3ff; text-decoration: none; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>لوحة نونو وِلت (MVP)</h1>
+
+    <div class="card">
+      <div class="row">
+        <div>
+          <label>API Token (الهيدر X-Api-Key)</label>
+          <input id="apiKey" placeholder="ادخل مفتاح API" />
+          <div class="muted">يُحفَظ محليًا في المتصفح (localStorage)</div>
+        </div>
+        <div>
+          <label>Wallet ID (معرّف المحفظة)</label>
+          <input id="walletId" placeholder="UUID لمحفظتك" />
+          <div class="flex">
+            <button class="btn" id="btnCreate">إنشاء محفظة</button>
+            <button id="btnSaveIds">حفظ</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <div>
+          <label>مبلغ</label>
+          <input id="amount" type="number" step="0.01" placeholder="مثال: 200" />
+        </div>
+        <div>
+          <label>عمليات على المحفظة</label>
+          <div class="flex">
+            <button class="btn" id="btnDeposit">إيداع</button>
+            <button id="btnWithdraw">سحب</button>
+            <button id="btnBalance">عرض الرصيد</button>
+          </div>
+          <div class="space"></div>
+          <label>تحويل إلى محفظة أخرى</label>
+          <input id="toWallet" placeholder="To Wallet ID" />
+          <div class="space"></div>
+          <button id="btnTransfer">تحويل</button>
+        </div>
+      </div>
+      <div class="foot">
+        <div class="muted" id="status">جاهز</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <div>
+          <label>فلترة السجل</label>
+          <div class="row">
+            <div>
+              <label>Type</label>
+              <select id="type">
+                <option value="">الكل</option>
+                <option value="deposit">deposit</option>
+                <option value="withdraw">withdraw</option>
+                <option value="transfer_in">transfer_in</option>
+                <option value="transfer_out">transfer_out</option>
+              </select>
+            </div>
+            <div>
+              <label>من وقت (ISO)</label>
+              <input id="from" placeholder="2025-09-01T00:00:00Z" />
+            </div>
+            <div>
+              <label>إلى وقت (ISO)</label>
+              <input id="to" placeholder="2025-09-01T23:59:59Z" />
+            </div>
+          </div>
+          <div class="space"></div>
+          <div class="flex">
+            <button class="btn" id="btnLoad">تحميل السجل</button>
+            <button id="btnCsv">تنزيل CSV</button>
+          </div>
+        </div>
+      </div>
+      <div class="space"></div>
+      <div style="max-height: 360px; overflow: auto;">
+        <table id="grid">
+          <thead>
+            <tr>
+              <th>id</th>
+              <th>type</th>
+              <th>amount</th>
+              <th>created_at</th>
+              <th>counterparty</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>طلبات السحب (Withdrawals)</h3>
+      <div class="row">
+        <div>
+          <label>طريقة السحب</label>
+          <select id="wdMethod">
+            <option value="western_union">Western Union</option>
+            <option value="qi_card">Qi Card (يدوي)</option>
+          </select>
+        </div>
+        <div>
+          <label>اسم المستفيد</label>
+          <input id="wdName" placeholder="الاسم الكامل" />
+        </div>
+        <div>
+          <label>تفاصيل/فرع/ملاحظة</label>
+          <input id="wdDetails" placeholder="Baghdad branch" />
+        </div>
+      </div>
+      <div class="space"></div>
+      <div class="flex">
+        <button class="btn" id="btnWdCreate">إنشاء طلب سحب</button>
+        <button id="btnWdList">عرض الطلبات</button>
+      </div>
+      <div class="space"></div>
+      <div class="row">
+        <div>
+          <label>Withdrawal ID</label>
+          <input id="wdId" placeholder="معرّف طلب السحب" />
+        </div>
+        <div>
+          <label>Payment Reference</label>
+          <input id="wdRef" placeholder="WU-REF-12345" />
+        </div>
+        <div style="align-self:end">
+          <button id="btnWdPaid">تعليم كمدفوع</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="muted">© Nono Wallet MVP</div>
+  </div>
+
+  <script>
+    const base = window.location.origin;
+    const $ = (id) => document.getElementById(id);
+    const statusEl = $("status");
+    const gridBody = $("grid").querySelector("tbody");
+
+    // حفظ/تحميل API key & wallet id محليًا
+    (function restore() {
+      const k = localStorage.getItem("apiKey") || "";
+      $("apiKey").value = k;
+      const w = localStorage.getItem("walletId") || "";
+      $("walletId").value = w;
+    })();
+
+    $("btnSaveIds").onclick = () => {
+      localStorage.setItem("apiKey", $("apiKey").value.trim());
+      localStorage.setItem("walletId", $("walletId").value.trim());
+      note("تم الحفظ محليًا");
+    };
+
+    function hdrs() {
+      const k = $("apiKey").value.trim();
+      return { "Content-Type": "application/json", "X-Api-Key": k };
+    }
+    function wid() { return $("walletId").value.trim(); }
+    function amt() { return Number($("amount").value); }
+    function note(msg) { statusEl.textContent = msg; }
+
+    function rowTx(r) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td><code>${r.id}</code></td>
+        <td>${pill(r.type)}</td>
+        <td>${r.amount.toFixed ? r.amount.toFixed(2) : r.amount}</td>
+        <td>${r.created_at}</td>
+        <td>${r.counterparty_wallet_id || ""}</td>`;
+      return tr;
+    }
+    function pill(type) {
+      const cls = (type === "deposit" || type === "transfer_in") ? "in" : "out";
+      return `<span class="pill ${cls}">${type}</span>`;
+    }
+
+    async function http(url, opts={}) {
+      const res = await fetch(url, opts);
+      if (!res.ok) {
+        const t = await res.text().catch(()=> "");
+        throw new Error(`HTTP ${res.status}: ${t}`);
+      }
+      const ct = res.headers.get("content-type") || "";
+      if (ct.includes("application/json")) return res.json();
+      return res.blob();
+    }
+
+    $("btnCreate").onclick = async () => {
+      try {
+        const data = await http(`${base}/wallet/create`, { method: "POST", headers: hdrs() });
+        $("walletId").value = data.wallet_id;
+        localStorage.setItem("walletId", data.wallet_id);
+        note(`تم إنشاء محفظة: ${data.wallet_id}`);
+      } catch (e) { note(e.message); }
+    };
+
+    $("btnDeposit").onclick = async () => {
+      try {
+        const data = await http(`${base}/wallet/deposit`, {
+          method: "POST", headers: hdrs(),
+          body: JSON.stringify({ wallet_id: wid(), amount: amt() })
+        });
+        note(`الرصيد: ${data.balance}`);
+      } catch (e) { note(e.message); }
+    };
+
+    $("btnWithdraw").onclick = async () => {
+      try {
+        const data = await http(`${base}/wallet/withdraw`, {
+          method: "POST", headers: hdrs(),
+          body: JSON.stringify({ wallet_id: wid(), amount: amt() })
+        });
+        note(`الرصيد: ${data.balance}`);
+      } catch (e) { note(e.message); }
+    };
+
+    $("btnBalance").onclick = async () => {
+      try {
+        const url = `${base}/wallet/balance?wallet_id=${encodeURIComponent(wid())}`;
+        const data = await http(url, { headers: hdrs() });
+        note(`الرصيد الحالي: ${data.balance}`);
+      } catch (e) { note(e.message); }
+    };
+
+    $("btnTransfer").onclick = async () => {
+      const to = $("toWallet").value.trim();
+      try {
+        const data = await http(`${base}/wallet/transfer`, {
+          method: "POST", headers: hdrs(),
+          body: JSON.stringify({ from_wallet_id: wid(), to_wallet_id: to, amount: amt() })
+        });
+        note(`تحويل ناجح: ${data.amount} → رصيدك: ${data.from_balance}`);
+      } catch (e) { note(e.message); }
+    };
+
+    $("btnLoad").onclick = async () => {
+      const t = $("type").value.trim();
+      const f = $("from").value.trim();
+      const to = $("to").value.trim();
+      const qs = new URLSearchParams({ wallet_id: wid() });
+      if (t) qs.set("type", t);
+      if (f) qs.set("from", f);
+      if (to) qs.set("to", to);
+
+      try {
+        const data = await http(`${base}/transactions?${qs.toString()}`, { headers: hdrs() });
+        gridBody.innerHTML = "";
+        data.items.forEach(r => gridBody.appendChild(rowTx(r)));
+        note(`تم تحميل ${data.count} عملية`);
+      } catch (e) { note(e.message); }
+    };
+
+    $("btnCsv").onclick = async () => {
+      const t = $("type").value.trim();
+      const f = $("from").value.trim();
+      const to = $("to").value.trim();
+      const qs = new URLSearchParams({ wallet_id: wid() });
+      if (t) qs.set("type", t);
+      if (f) qs.set("from", f);
+      if (to) qs.set("to", to);
+      try {
+        const blob = await http(`${base}/transactions/export.csv?${qs.toString()}`, { headers: hdrs() });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `transactions_${wid()}.csv`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+        note("تم تنزيل CSV");
+      } catch (e) { note(e.message); }
+    };
+
+    // Withdrawals
+    $("btnWdCreate").onclick = async () => {
+      try {
+        const body = {
+          wallet_id: wid(),
+          amount: amt(),
+          method: $("wdMethod").value,
+          beneficiary_name: $("wdName").value.trim(),
+          details: $("wdDetails").value.trim()
+        };
+        const data = await http(`${base}/withdrawal/create`, {
+          method: "POST", headers: hdrs(), body: JSON.stringify(body)
+        });
+        $("wdId").value = data.withdrawal_id;
+        note(`إنشاء طلب: ${data.withdrawal_id} (${data.status})`);
+      } catch (e) { note(e.message); }
+    };
+
+    $("btnWdList").onclick = async () => {
+      try {
+        const data = await http(`${base}/withdrawal/list?wallet_id=${encodeURIComponent(wid())}`, { headers: hdrs() });
+        // عرض السجل بالجدول نفسه (مع نوع "withdraw")
+        gridBody.innerHTML = "";
+        data.items.forEach(r => {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `
+            <td><code>${r.id}</code></td>
+            <td><span class="pill out">withdraw(${r.status})</span></td>
+            <td>${Number(r.amount).toFixed(2)}</td>
+            <td>${r.created_at}</td>
+            <td>${r.method} ${r.payment_reference ? "(" + r.payment_reference + ")" : ""}</td>`;
+          gridBody.appendChild(tr);
+        });
+        note(`طلبات: ${data.count}`);
+      } catch (e) { note(e.message); }
+    };
+
+    $("btnWdPaid").onclick = async () => {
+      try {
+        const body = {
+          withdrawal_id: $("wdId").value.trim(),
+          payment_reference: $("wdRef").value.trim()
+        };
+        const data = await http(`${base}/withdrawal/mark_paid`, {
+          method: "POST", headers: hdrs(), body: JSON.stringify(body)
+        });
+        note(`تم تعليم مدفوع: الرصيد الآن ${data.balance}`);
+      } catch (e) { note(e.message); }
+    };
+  </script>
+</body>
+</html>
 
