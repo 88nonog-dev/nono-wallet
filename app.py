@@ -1,579 +1,639 @@
-from flask import Flask, jsonify, request, Response, render_template, redirect
+# app.py
 import os
 import uuid
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-from datetime import datetime, timezone
+import json
+import io
 import csv
-from io import StringIO
+from datetime import datetime
+from decimal import Decimal
+
+from flask import Flask, request, jsonify, send_file, render_template_string
 
 from sqlalchemy import (
-    create_engine, String, Numeric, DateTime, Enum, ForeignKey, Text,
-    select, desc, and_
+    create_engine, Column, String, DateTime, Numeric, ForeignKey, Text, select, func
 )
-from sqlalchemy.orm import (
-    sessionmaker, DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy.orm import declarative_base, relationship, sessionmaker, scoped_session
+from sqlalchemy.exc import IntegrityError, OperationalError
+
+import requests
+
+# ------------------------------------------------------------------------------
+# Config
+# ------------------------------------------------------------------------------
+API_TOKEN = os.getenv("API_TOKEN", "")
+WHOAMI_TOKEN = os.getenv("WHOAMI_TOKEN", "")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+
+NONO_LLM_URL = os.getenv("NONO_LLM_URL", "https://api.openai.com/v1/chat/completions")
+NONO_LLM_KEY = os.getenv("NONO_LLM_KEY", "")
+NONO_LLM_MODEL = os.getenv("NONO_LLM_MODEL", "gpt-4o-mini")
+
+app = Flask(__name__)
+
+# ------------------------------------------------------------------------------
+# Database (SQLAlchemy, Neon Postgres)
+# ------------------------------------------------------------------------------
+if not DATABASE_URL:
+    # Allow local dev with SQLite fallback (not used on Railway/Neon)
+    DATABASE_URL = "sqlite:///nono_wallet.sqlite3"
+
+connect_args = {}
+if DATABASE_URL.startswith("postgres"):
+    # Neon usually requires SSL
+    connect_args = {"sslmode": "require"}
+
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    connect_args=connect_args if DATABASE_URL.startswith("postgres") else {},
 )
+SessionLocal = scoped_session(sessionmaker(bind=engine, autoflush=False, autocommit=False))
+Base = declarative_base()
 
-# =========================
-# DB Setup
-# =========================
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///data.db")
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+def now_utc():
+    return datetime.utcnow()
 
-class Base(DeclarativeBase):
-    pass
 
-# =========================
-# Models
-# =========================
 class Wallet(Base):
     __tablename__ = "wallets"
-    id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    balance: Mapped[Decimal] = mapped_column(Numeric(18, 2), default=Decimal("0.00"))
-    transactions: Mapped[list["Transaction"]] = relationship(
-        back_populates="wallet", cascade="all, delete-orphan"
-    )
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    name = Column(String, unique=True, nullable=False)
+    balance = Column(Numeric(18, 8), nullable=False, default=Decimal("0"))
+    created_at = Column(DateTime, default=now_utc, nullable=False)
 
-class TxType:
-    DEPOSIT = "deposit"
-    WITHDRAW = "withdraw"
-    TRANSFER_IN = "transfer_in"
-    TRANSFER_OUT = "transfer_out"
+    txns = relationship("Transaction", back_populates="wallet", cascade="all,delete-orphan")
 
-ALLOWED_TYPES = {
-    TxType.DEPOSIT, TxType.WITHDRAW, TxType.TRANSFER_IN, TxType.TRANSFER_OUT
-}
 
 class Transaction(Base):
     __tablename__ = "transactions"
-    id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    wallet_id: Mapped[str] = mapped_column(String(64), ForeignKey("wallets.id"), index=True)
-    type: Mapped[str] = mapped_column(
-        Enum(TxType.DEPOSIT, TxType.WITHDRAW, TxType.TRANSFER_IN, TxType.TRANSFER_OUT, name="tx_type_enum"),
-        nullable=False
-    )
-    amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True, nullable=False)
-    counterparty_wallet_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    wallet_id = Column(String, ForeignKey("wallets.id"), index=True, nullable=False)
+    type = Column(String, nullable=False)  # create/deposit/withdraw/transfer_in/transfer_out
+    amount = Column(Numeric(18, 8), nullable=False)
+    meta = Column(Text, nullable=True)     # JSON string for extras
+    created_at = Column(DateTime, default=now_utc, nullable=False)
 
-    wallet: Mapped[Wallet] = relationship(back_populates="transactions")
+    wallet = relationship("Wallet", back_populates="txns")
 
-# --- Withdrawals ---
-class WDStatus:
-    PENDING = "pending"
-    PAID = "paid"
-    CANCELED = "canceled"
 
-ALLOWED_WD_STATUS = {WDStatus.PENDING, WDStatus.PAID, WDStatus.CANCELED}
+def init_db():
+    Base.metadata.create_all(engine)
 
-class WithdrawalRequest(Base):
-    __tablename__ = "withdrawal_requests"
-    id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    wallet_id: Mapped[str] = mapped_column(String(64), ForeignKey("wallets.id"), index=True)
-    amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
-    method: Mapped[str] = mapped_column(String(32), nullable=False, default="western_union")
-    beneficiary_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    last4: Mapped[str | None] = mapped_column(String(8), nullable=True)  # partial id
-    details: Mapped[str | None] = mapped_column(Text, nullable=True)     # note/city/etc.
-    status: Mapped[str] = mapped_column(
-        Enum(WDStatus.PENDING, WDStatus.PAID, WDStatus.CANCELED, name="wd_status_enum"),
-        default=WDStatus.PENDING, index=True
-    )
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True, nullable=False)
-    paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    tx_id: Mapped[str | None] = mapped_column(String(64), nullable=True)  # withdraw tx id
-    payment_reference: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
-Base.metadata.create_all(bind=engine)
+@app.teardown_appcontext
+def remove_session(exception=None):
+    SessionLocal.remove()
 
-# =========================
-# Flask App
-# =========================
-app = Flask(__name__, template_folder="templates")
+init_db()
 
-# 🔐 API Key protection
-API_TOKEN = os.getenv("API_TOKEN", "")
+# ------------------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------------------
+def decimal_to_float(x):
+    return float(x) if isinstance(x, Decimal) else x
 
-@app.before_request
-def require_api_key():
-    # مسارات مفتوحة بدون مفتاح
-    open_paths = {"/health", "/whoami", "/", "/dashboard"}
-    if request.path in open_paths:
-        return
-    key = request.headers.get("X-Api-Key", "")
-    if not API_TOKEN or key != API_TOKEN:
-        return jsonify(ok=False, error="unauthorized"), 401
+def tx_to_dict(t: Transaction, with_wallet=False):
+    data = {
+        "id": t.id,
+        "wallet_id": t.wallet_id,
+        "type": t.type,
+        "amount": decimal_to_float(t.amount),
+        "created_at": t.created_at.isoformat() + "Z",
+    }
+    if t.meta:
+        try:
+            data["meta"] = json.loads(t.meta)
+        except Exception:
+            data["meta"] = t.meta
+    if with_wallet and t.wallet:
+        data["wallet"] = {"id": t.wallet.id, "name": t.wallet.name, "balance": decimal_to_float(t.wallet.balance)}
+    return data
 
-# ---- helpers ----
-def d(val) -> Decimal:
-    """Normalize to Decimal(2dp)."""
-    if isinstance(val, Decimal):
-        q = val
-    else:
-        q = Decimal(str(val))
-    return q.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+def require_api_key(func):
+    # Decorator to protect endpoints with X-Api-Key
+    from functools import wraps
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        token = request.headers.get("X-Api-Key", "")
+        if not API_TOKEN or token != API_TOKEN:
+            return jsonify({"ok": False, "error": "Unauthorized (X-Api-Key)"}), 401
+        return func(*args, **kwargs)
+    return wrapper
 
-def now_utc() -> datetime:
-    return datetime.now(timezone.utc)
-
-def parse_iso8601(s: str | None) -> datetime | None:
-    """Parse ISO8601; supports trailing 'Z'."""
-    if not s:
-        return None
-    s = s.strip()
-    try:
-        if s.endswith("Z"):
-            s = s.replace("Z", "+00:00")
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt
-    except Exception:
-        return None
-
-def add_tx(db, wallet_id: str, tx_type: str, amount: Decimal, counterparty: str | None = None):
-    tx = Transaction(
-        id=str(uuid.uuid4()),
-        wallet_id=wallet_id,
-        type=tx_type,
-        amount=d(amount),
-        created_at=now_utc(),
-        counterparty_wallet_id=counterparty,
-    )
-    db.add(tx)
-    return tx
-
-# =========================
-# Dashboard routes (open)
-# =========================
-@app.get("/")
-def root_redirect():
-    return redirect("/dashboard")
-
-@app.get("/dashboard")
-def dashboard():
-    # صفحة HTML بسيطة—الطلبات API تتطلب X-Api-Key
-    return render_template("index.html")
-
-# =========================
-# Health & Whoami
-# =========================
+# ------------------------------------------------------------------------------
+# Legacy / Utility Routes
+# ------------------------------------------------------------------------------
 @app.get("/health")
 def health():
-    return jsonify(ok=True)
+    return jsonify({"ok": True, "time": now_utc().isoformat() + "Z"})
+
+@app.get("/__ping")
+def __ping():
+    routes_count = len([r for r in app.url_map.iter_rules()])
+    has_debug_llm = bool(NONO_LLM_KEY and NONO_LLM_URL and NONO_LLM_MODEL)
+    return jsonify({
+        "ok": True,
+        "routes_count": routes_count,
+        "has_debug_llm": has_debug_llm
+    })
 
 @app.get("/whoami")
 def whoami():
-    token = request.headers.get("X-Auth-Token", "")
-    if not token:
-        return jsonify(ok=False, error="missing token"), 401
-    return jsonify(ok=True, token=token)
+    # Backwards-compat: header X-Auth-Token must match WHOAMI_TOKEN
+    hdr = request.headers.get("X-Auth-Token", "")
+    return jsonify({
+        "ok": bool(WHOAMI_TOKEN and hdr == WHOAMI_TOKEN),
+        "you": "nono-user",
+        "matched": bool(WHOAMI_TOKEN and hdr == WHOAMI_TOKEN)
+    })
 
-# =========================
-# Wallet Endpoints
-# =========================
-@app.post("/wallet/create")
-def create_wallet():
-    db = SessionLocal()
+@app.get("/nono/api/env_names")
+@require_api_key
+def env_names():
+    names = sorted([
+        n for n in os.environ.keys()
+        if n.startswith("NONO_") or n in ["API_TOKEN", "WHOAMI_TOKEN", "DATABASE_URL"]
+    ])
+    return jsonify({"names": names})
+
+@app.get("/nono/api/debug_llm")
+@require_api_key
+def debug_llm():
+    return jsonify({
+        "has_key": bool(NONO_LLM_KEY),
+        "has_url": bool(NONO_LLM_URL),
+        "model": NONO_LLM_MODEL or "",
+        "ok": bool(NONO_LLM_KEY and NONO_LLM_URL and NONO_LLM_MODEL)
+    })
+
+@app.post("/nono/api/ask")
+@require_api_key
+def nono_ask():
+    data = request.get_json(silent=True) or {}
+    prompt = data.get("prompt") or request.form.get("prompt") or ""
+    if not prompt:
+        return jsonify({"ok": False, "error": "Missing 'prompt'"}), 400
+
+    if not (NONO_LLM_KEY and NONO_LLM_URL and NONO_LLM_MODEL):
+        return jsonify({"ok": False, "error": "LLM not configured"}), 500
+
     try:
-        wallet_id = str(uuid.uuid4())
-        w = Wallet(id=wallet_id, balance=d("0"))
-        db.add(w)
-        db.commit()
-        return jsonify(ok=True, wallet_id=wallet_id, balance=float(w.balance))
+        headers = {
+            "Authorization": f"Bearer {NONO_LLM_KEY}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": NONO_LLM_MODEL,
+            "messages": [
+                {"role": "system", "content": "You are Nono, a helpful assistant."},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.2,
+        }
+        resp = requests.post(NONO_LLM_URL, headers=headers, json=payload, timeout=30)
+        resp.raise_for_status()
+        j = resp.json()
+        # OpenAI-style response parsing
+        content = (
+            j.get("choices", [{}])[0]
+             .get("message", {})
+             .get("content", "")
+        )
+        return jsonify({"ok": True, "model": NONO_LLM_MODEL, "answer": content})
+    except requests.RequestException as e:
+        return jsonify({"ok": False, "error": str(e)}), 502
+
+# ------------------------------------------------------------------------------
+# Wallet Core
+# ------------------------------------------------------------------------------
+@app.post("/wallet/create")
+@require_api_key
+def wallet_create():
+    sess = SessionLocal()
+    try:
+        data = request.get_json(silent=True) or {}
+        name = (data.get("name") or "").strip()
+        if not name:
+            return jsonify({"ok": False, "error": "name required"}), 400
+
+        w = Wallet(name=name, balance=Decimal("0"))
+        sess.add(w)
+        sess.flush()
+
+        t = Transaction(wallet_id=w.id, type="create", amount=Decimal("0"), meta=json.dumps({"name": name}))
+        sess.add(t)
+        sess.commit()
+
+        return jsonify({"ok": True, "wallet": {"id": w.id, "name": w.name, "balance": decimal_to_float(w.balance)}})
+    except IntegrityError:
+        sess.rollback()
+        return jsonify({"ok": False, "error": "wallet name already exists"}), 409
     finally:
-        db.close()
+        sess.close()
 
 @app.get("/wallet/balance")
+@require_api_key
 def wallet_balance():
     wallet_id = request.args.get("wallet_id", "")
     if not wallet_id:
-        return jsonify(ok=False, error="wallet_id_required"), 400
-    db = SessionLocal()
+        return jsonify({"ok": False, "error": "wallet_id required"}), 400
+    sess = SessionLocal()
     try:
-        w = db.get(Wallet, wallet_id)
+        w = sess.get(Wallet, wallet_id)
         if not w:
-            return jsonify(ok=False, error="wallet_not_found"), 404
-        return jsonify(ok=True, wallet_id=wallet_id, balance=float(w.balance))
+            return jsonify({"ok": False, "error": "wallet not found"}), 404
+        return jsonify({"ok": True, "wallet": {"id": w.id, "name": w.name, "balance": decimal_to_float(w.balance)}})
     finally:
-        db.close()
+        sess.close()
 
 @app.post("/wallet/deposit")
+@require_api_key
 def wallet_deposit():
-    data = request.get_json(silent=True) or {}
-    wallet_id = data.get("wallet_id", "")
-    amount = data.get("amount", None)
-    if not wallet_id:
-        return jsonify(ok=False, error="wallet_id_required"), 400
+    sess = SessionLocal()
     try:
-        amount = d(amount)
-    except (TypeError, InvalidOperation):
-        return jsonify(ok=False, error="invalid_amount"), 400
-    if amount <= 0:
-        return jsonify(ok=False, error="amount_must_be_positive"), 400
+        data = request.get_json(silent=True) or {}
+        wallet_id = data.get("wallet_id", "")
+        amount = Decimal(str(data.get("amount", "0")))
+        if not wallet_id or amount <= 0:
+            return jsonify({"ok": False, "error": "wallet_id and positive amount required"}), 400
 
-    db = SessionLocal()
-    try:
-        w = db.get(Wallet, wallet_id)
+        w = sess.get(Wallet, wallet_id)
         if not w:
-            return jsonify(ok=False, error="wallet_not_found"), 404
-        w.balance = d(w.balance + amount)
-        add_tx(db, wallet_id, TxType.DEPOSIT, amount)
-        db.commit()
-        return jsonify(ok=True, wallet_id=wallet_id, balance=float(w.balance))
+            return jsonify({"ok": False, "error": "wallet not found"}), 404
+
+        w.balance = (w.balance or Decimal("0")) + amount
+        t = Transaction(wallet_id=w.id, type="deposit", amount=amount, meta=None)
+        sess.add(t)
+        sess.commit()
+        return jsonify({"ok": True, "balance": decimal_to_float(w.balance), "tx": tx_to_dict(t)})
     finally:
-        db.close()
+        sess.close()
 
 @app.post("/wallet/withdraw")
+@require_api_key
 def wallet_withdraw():
-    data = request.get_json(silent=True) or {}
-    wallet_id = data.get("wallet_id", "")
-    amount = data.get("amount", None)
-    if not wallet_id:
-        return jsonify(ok=False, error="wallet_id_required"), 400
+    sess = SessionLocal()
     try:
-        amount = d(amount)
-    except (TypeError, InvalidOperation):
-        return jsonify(ok=False, error="invalid_amount"), 400
-    if amount <= 0:
-        return jsonify(ok=False, error="amount_must_be_positive"), 400
+        data = request.get_json(silent=True) or {}
+        wallet_id = data.get("wallet_id", "")
+        amount = Decimal(str(data.get("amount", "0")))
+        if not wallet_id or amount <= 0:
+            return jsonify({"ok": False, "error": "wallet_id and positive amount required"}), 400
 
-    db = SessionLocal()
-    try:
-        w = db.get(Wallet, wallet_id)
+        w = sess.get(Wallet, wallet_id)
         if not w:
-            return jsonify(ok=False, error="wallet_not_found"), 404
+            return jsonify({"ok": False, "error": "wallet not found"}), 404
+
         if w.balance < amount:
-            return jsonify(ok=False, error="insufficient_funds"), 400
-        w.balance = d(w.balance - amount)
-        add_tx(db, wallet_id, TxType.WITHDRAW, amount)
-        db.commit()
-        return jsonify(ok=True, wallet_id=wallet_id, balance=float(w.balance))
+            return jsonify({"ok": False, "error": "insufficient funds"}), 400
+
+        w.balance = w.balance - amount
+        t = Transaction(wallet_id=w.id, type="withdraw", amount=amount, meta=None)
+        sess.add(t)
+        sess.commit()
+        return jsonify({"ok": True, "balance": decimal_to_float(w.balance), "tx": tx_to_dict(t)})
     finally:
-        db.close()
+        sess.close()
 
 @app.post("/wallet/transfer")
+@require_api_key
 def wallet_transfer():
-    data = request.get_json(silent=True) or {}
-    from_id = data.get("from_wallet_id", "")
-    to_id = data.get("to_wallet_id", "")
-    amount = data.get("amount", None)
-    if not from_id or not to_id:
-        return jsonify(ok=False, error="wallet_ids_required"), 400
-    if from_id == to_id:
-        return jsonify(ok=False, error="same_wallet"), 400
+    sess = SessionLocal()
     try:
-        amount = d(amount)
-    except (TypeError, InvalidOperation):
-        return jsonify(ok=False, error="invalid_amount"), 400
-    if amount <= 0:
-        return jsonify(ok=False, error="amount_must_be_positive"), 400
+        data = request.get_json(silent=True) or {}
+        from_id = data.get("from_wallet_id", "")
+        to_id = data.get("to_wallet_id", "")
+        amount = Decimal(str(data.get("amount", "0")))
+        if not from_id or not to_id or amount <= 0:
+            return jsonify({"ok": False, "error": "from_wallet_id, to_wallet_id and positive amount required"}), 400
+        if from_id == to_id:
+            return jsonify({"ok": False, "error": "cannot transfer to same wallet"}), 400
 
-    db = SessionLocal()
-    try:
-        w_from = db.get(Wallet, from_id)
-        if not w_from:
-            return jsonify(ok=False, error="from_wallet_not_found"), 404
-        w_to = db.get(Wallet, to_id)
-        if not w_to:
-            return jsonify(ok=False, error="to_wallet_not_found"), 404
-        if w_from.balance < amount:
-            return jsonify(ok=False, error="insufficient_funds"), 400
+        wf = sess.get(Wallet, from_id)
+        wt = sess.get(Wallet, to_id)
+        if not wf or not wt:
+            return jsonify({"ok": False, "error": "wallet not found"}), 404
+        if wf.balance < amount:
+            return jsonify({"ok": False, "error": "insufficient funds"}), 400
 
-        w_from.balance = d(w_from.balance - amount)
-        w_to.balance = d(w_to.balance + amount)
+        wf.balance = wf.balance - amount
+        wt.balance = (wt.balance or Decimal("0")) + amount
 
-        add_tx(db, from_id, TxType.TRANSFER_OUT, amount, counterparty=to_id)
-        add_tx(db, to_id, TxType.TRANSFER_IN, amount, counterparty=from_id)
+        meta_out = {"to": wt.id, "to_name": wt.name}
+        meta_in  = {"from": wf.id, "from_name": wf.name}
 
-        db.commit()
-        return jsonify(
-            ok=True,
-            from_wallet_id=from_id,
-            to_wallet_id=to_id,
-            amount=float(amount),
-            from_balance=float(w_from.balance),
-            to_balance=float(w_to.balance),
-        )
+        t_out = Transaction(wallet_id=wf.id, type="transfer_out", amount=amount, meta=json.dumps(meta_out))
+        t_in  = Transaction(wallet_id=wt.id, type="transfer_in", amount=amount, meta=json.dumps(meta_in))
+
+        sess.add_all([t_out, t_in])
+        sess.commit()
+        return jsonify({
+            "ok": True,
+            "from_balance": decimal_to_float(wf.balance),
+            "to_balance": decimal_to_float(wt.balance),
+            "tx_out": tx_to_dict(t_out),
+            "tx_in": tx_to_dict(t_in),
+        })
     finally:
-        db.close()
+        sess.close()
 
-# =========================
-# Transactions: list + filters
-# =========================
+# ------------------------------------------------------------------------------
+# Transactions: list + filters + CSV export
+# ------------------------------------------------------------------------------
 @app.get("/transactions")
-def list_transactions():
-    wallet_id = request.args.get("wallet_id", "")
-    limit = request.args.get("limit", "50")
-    offset = request.args.get("offset", "0")
-    type_filter = request.args.get("type", "").strip().lower()
-    from_s = request.args.get("from", "")
-    to_s = request.args.get("to", "")
-
-    if not wallet_id:
-        return jsonify(ok=False, error="wallet_id_required"), 400
-
+@require_api_key
+def transactions_list():
+    sess = SessionLocal()
     try:
-        limit_i = max(1, min(200, int(limit)))
-        offset_i = max(0, int(offset))
-    except ValueError:
-        return jsonify(ok=False, error="invalid_pagination"), 400
+        q = sess.query(Transaction).order_by(Transaction.created_at.desc())
 
-    if type_filter and type_filter not in ALLOWED_TYPES:
-        return jsonify(ok=False, error="invalid_type_filter"), 400
+        wallet_id = request.args.get("wallet_id")
+        tx_type = request.args.get("type")
+        date_from = request.args.get("date_from")
+        date_to = request.args.get("date_to")
+        page = int(request.args.get("page", "1"))
+        page_size = min(200, int(request.args.get("page_size", "50")))
 
-    dt_from = parse_iso8601(from_s) if from_s else None
-    dt_to = parse_iso8601(to_s) if to_s else None
-    if from_s and not dt_from:
-        return jsonify(ok=False, error="invalid_from_datetime"), 400
-    if to_s and not dt_to:
-        return jsonify(ok=False, error="invalid_to_datetime"), 400
+        if wallet_id:
+            q = q.filter(Transaction.wallet_id == wallet_id)
+        if tx_type:
+            q = q.filter(Transaction.type == tx_type)
+        if date_from:
+            try:
+                df = datetime.fromisoformat(date_from.replace("Z", "").replace("z", ""))
+                q = q.filter(Transaction.created_at >= df)
+            except Exception:
+                pass
+        if date_to:
+            try:
+                dt = datetime.fromisoformat(date_to.replace("Z", "").replace("z", ""))
+                q = q.filter(Transaction.created_at <= dt)
+            except Exception:
+                pass
 
-    db = SessionLocal()
-    try:
-        if not db.get(Wallet, wallet_id):
-            return jsonify(ok=False, error="wallet_not_found"), 404
-
-        conds = [Transaction.wallet_id == wallet_id]
-        if type_filter:
-            conds.append(Transaction.type == type_filter)
-        if dt_from:
-            conds.append(Transaction.created_at >= dt_from)
-        if dt_to:
-            conds.append(Transaction.created_at <= dt_to)
-
-        stmt = (
-            select(Transaction)
-            .where(and_(*conds))
-            .order_by(desc(Transaction.created_at))
-            .limit(limit_i)
-            .offset(offset_i)
-        )
-        rows = db.execute(stmt).scalars().all()
-        items = [{
-            "id": r.id,
-            "wallet_id": r.wallet_id,
-            "type": r.type,
-            "amount": float(r.amount),
-            "created_at": r.created_at.isoformat(),
-            "counterparty_wallet_id": r.counterparty_wallet_id,
-        } for r in rows]
-        return jsonify(ok=True, wallet_id=wallet_id, count=len(items), items=items)
+        total = q.count()
+        items = q.offset((page - 1) * page_size).limit(page_size).all()
+        return jsonify({
+            "ok": True,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "items": [tx_to_dict(t) for t in items],
+        })
     finally:
-        db.close()
+        sess.close()
 
-# =========================
-# Transactions: export CSV
-# =========================
 @app.get("/transactions/export.csv")
-def export_transactions_csv():
-    wallet_id = request.args.get("wallet_id", "")
-    type_filter = request.args.get("type", "").strip().lower()
-    from_s = request.args.get("from", "")
-    to_s = request.args.get("to", "")
-
-    if not wallet_id:
-        return jsonify(ok=False, error="wallet_id_required"), 400
-    if type_filter and type_filter not in ALLOWED_TYPES:
-        return jsonify(ok=False, error="invalid_type_filter"), 400
-
-    dt_from = parse_iso8601(from_s) if from_s else None
-    dt_to = parse_iso8601(to_s) if to_s else None
-    if from_s and not dt_from:
-        return jsonify(ok=False, error="invalid_from_datetime"), 400
-    if to_s and not dt_to:
-        return jsonify(ok=False, error="invalid_to_datetime"), 400
-
-    db = SessionLocal()
+@require_api_key
+def transactions_export_csv():
+    sess = SessionLocal()
     try:
-        if not db.get(Wallet, wallet_id):
-            return jsonify(ok=False, error="wallet_not_found"), 404
+        q = sess.query(Transaction).order_by(Transaction.created_at.desc())
 
-        conds = [Transaction.wallet_id == wallet_id]
-        if type_filter:
-            conds.append(Transaction.type == type_filter)
-        if dt_from:
-            conds.append(Transaction.created_at >= dt_from)
-        if dt_to:
-            conds.append(Transaction.created_at <= dt_to)
+        wallet_id = request.args.get("wallet_id")
+        tx_type = request.args.get("type")
+        date_from = request.args.get("date_from")
+        date_to = request.args.get("date_to")
 
-        stmt = (
-            select(Transaction)
-            .where(and_(*conds))
-            .order_by(desc(Transaction.created_at))
-        )
-        rows = db.execute(stmt).scalars().all()
+        if wallet_id:
+            q = q.filter(Transaction.wallet_id == wallet_id)
+        if tx_type:
+            q = q.filter(Transaction.type == tx_type)
+        if date_from:
+            try:
+                df = datetime.fromisoformat(date_from.replace("Z", "").replace("z", ""))
+                q = q.filter(Transaction.created_at >= df)
+            except Exception:
+                pass
+        if date_to:
+            try:
+                dt = datetime.fromisoformat(date_to.replace("Z", "").replace("z", ""))
+                q = q.filter(Transaction.created_at <= dt)
+            except Exception:
+                pass
 
-        buf = StringIO()
+        rows = q.all()
+
+        buf = io.StringIO()
         writer = csv.writer(buf)
-        writer.writerow(["id", "wallet_id", "type", "amount", "created_at", "counterparty_wallet_id"])
-        for r in rows:
+        writer.writerow(["id", "wallet_id", "type", "amount", "created_at", "meta"])
+        for t in rows:
             writer.writerow([
-                r.id,
-                r.wallet_id,
-                r.type,
-                f"{float(r.amount):.2f}",
-                r.created_at.isoformat(),
-                r.counterparty_wallet_id or "",
+                t.id,
+                t.wallet_id,
+                t.type,
+                str(t.amount),
+                t.created_at.isoformat() + "Z",
+                t.meta or "",
             ])
-        csv_data = buf.getvalue()
-        buf.close()
-
-        filename = f"transactions_{wallet_id}.csv"
-        headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
-        return Response(csv_data, mimetype="text/csv", headers=headers)
-    finally:
-        db.close()
-
-# =========================
-# Withdrawals: create / list / mark_paid
-# =========================
-@app.post("/withdrawal/create")
-def withdrawal_create():
-    data = request.get_json(silent=True) or {}
-    wallet_id = data.get("wallet_id", "")
-    amount = data.get("amount", None)
-    method = (data.get("method") or "western_union").strip().lower()
-    beneficiary_name = data.get("beneficiary_name")
-    last4 = data.get("last4")
-    details = data.get("details")
-
-    if not wallet_id:
-        return jsonify(ok=False, error="wallet_id_required"), 400
-    try:
-        amount = d(amount)
-    except (TypeError, InvalidOperation):
-        return jsonify(ok=False, error="invalid_amount"), 400
-    if amount <= 0:
-        return jsonify(ok=False, error="amount_must_be_positive"), 400
-
-    db = SessionLocal()
-    try:
-        w = db.get(Wallet, wallet_id)
-        if not w:
-            return jsonify(ok=False, error="wallet_not_found"), 404
-
-        wd = WithdrawalRequest(
-            id=str(uuid.uuid4()),
-            wallet_id=wallet_id,
-            amount=amount,
-            method=method,
-            beneficiary_name=beneficiary_name,
-            last4=last4,
-            details=details,
-            status="pending",
-            created_at=now_utc(),
-        )
-        db.add(wd)
-        db.commit()
-        return jsonify(ok=True, withdrawal_id=wd.id, status=wd.status, amount=float(amount), method=method)
-    finally:
-        db.close()
-
-@app.get("/withdrawal/list")
-def withdrawal_list():
-    wallet_id = request.args.get("wallet_id", "")
-    status_filter = request.args.get("status", "").strip().lower()
-    limit = request.args.get("limit", "50")
-    offset = request.args.get("offset", "0")
-
-    if not wallet_id:
-        return jsonify(ok=False, error="wallet_id_required"), 400
-    if status_filter and status_filter not in ALLOWED_WD_STATUS:
-        return jsonify(ok=False, error="invalid_status"), 400
-
-    try:
-        limit_i = max(1, min(200, int(limit)))
-        offset_i = max(0, int(offset))
-    except ValueError:
-        return jsonify(ok=False, error="invalid_pagination"), 400
-
-    db = SessionLocal()
-    try:
-        if not db.get(Wallet, wallet_id):
-            return jsonify(ok=False, error="wallet_not_found"), 404
-
-        conds = [WithdrawalRequest.wallet_id == wallet_id]
-        if status_filter:
-            conds.append(WithdrawalRequest.status == status_filter)
-
-        stmt = (
-            select(WithdrawalRequest)
-            .where(and_(*conds))
-            .order_by(desc(WithdrawalRequest.created_at))
-            .limit(limit_i)
-            .offset(offset_i)
-        )
-        rows = db.execute(stmt).scalars().all()
-        items = [{
-            "id": r.id,
-            "wallet_id": r.wallet_id,
-            "amount": float(r.amount),
-            "method": r.method,
-            "beneficiary_name": r.beneficiary_name,
-            "last4": r.last4,
-            "details": r.details,
-            "status": r.status,
-            "created_at": r.created_at.isoformat(),
-            "paid_at": r.paid_at.isoformat() if r.paid_at else None,
-            "tx_id": r.tx_id,
-            "payment_reference": r.payment_reference,
-        } for r in rows]
-        return jsonify(ok=True, wallet_id=wallet_id, count=len(items), items=items)
-    finally:
-        db.close()
-
-@app.post("/withdrawal/mark_paid")
-def withdrawal_mark_paid():
-    data = request.get_json(silent=True) or {}
-    withdrawal_id = data.get("withdrawal_id", "")
-    payment_reference = data.get("payment_reference")  # optional
-
-    if not withdrawal_id:
-        return jsonify(ok=False, error="withdrawal_id_required"), 400
-
-    db = SessionLocal()
-    try:
-        wd = db.get(WithdrawalRequest, withdrawal_id)
-        if not wd:
-            return jsonify(ok=False, error="withdrawal_not_found"), 404
-        if wd.status == "paid":
-            return jsonify(ok=False, error="already_paid", tx_id=wd.tx_id), 409
-
-        w = db.get(Wallet, wd.wallet_id)
-        if not w:
-            return jsonify(ok=False, error="wallet_not_found"), 404
-
-        if w.balance < wd.amount:
-            return jsonify(ok=False, error="insufficient_funds"), 400
-
-        w.balance = d(w.balance - wd.amount)
-        tx = add_tx(db, w.id, TxType.WITHDRAW, wd.amount)
-        wd.status = "paid"
-        wd.paid_at = now_utc()
-        wd.tx_id = tx.id
-        wd.payment_reference = payment_reference
-
-        db.commit()
-        return jsonify(
-            ok=True,
-            withdrawal_id=wd.id,
-            status=wd.status,
-            tx_id=wd.tx_id,
-            payment_reference=wd.payment_reference,
-            wallet_id=w.id,
-            balance=float(w.balance),
-            amount=float(wd.amount),
+        mem = io.BytesIO(buf.getvalue().encode("utf-8"))
+        mem.seek(0)
+        return send_file(
+            mem,
+            mimetype="text/csv",
+            as_attachment=True,
+            download_name="transactions.csv"
         )
     finally:
-        db.close()
+        sess.close()
 
-# =========================
-# Local run (Railway uses gunicorn)
-# =========================
+# ------------------------------------------------------------------------------
+# Simple Dashboard (pass ?key=YOUR_API_TOKEN to view)
+# ------------------------------------------------------------------------------
+DASHBOARD_HTML = """
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Nono Wallet Dashboard</title>
+<style>
+ body{background:#0b0f14;color:#e6edf3;font-family:system-ui,Segoe UI,Arial,sans-serif;margin:0}
+ header{padding:16px 20px;border-bottom:1px solid #1f2833;display:flex;justify-content:space-between;align-items:center}
+ h1{font-size:18px;margin:0}
+ main{padding:20px;max-width:1100px;margin:0 auto}
+ .card{background:#111827;border:1px solid #1f2833;border-radius:16px;padding:16px;margin-bottom:16px;box-shadow:0 4px 14px rgba(0,0,0,.25)}
+ label{display:block;margin:4px 0 8px}
+ input,select,button{background:#0b1220;color:#e6edf3;border:1px solid #243241;border-radius:10px;padding:8px 10px}
+ table{width:100%;border-collapse:collapse;margin-top:12px}
+ th,td{border-bottom:1px solid #243241;padding:8px;text-align:right}
+ th{opacity:.8}
+ .row{display:flex;gap:12px;flex-wrap:wrap}
+ .row > *{flex:1}
+ .muted{opacity:.7}
+ .pill{display:inline-block;padding:2px 8px;border-radius:999px;background:#0f172a;border:1px solid #243241;font-size:12px}
+ a{color:#8ab4ff}
+</style>
+</head>
+<body>
+<header>
+  <h1>نونو-والِت • Dashboard</h1>
+  <div class="muted">أدخل الصفحة هكذا: <code>/dashboard?key=YOUR_API_TOKEN</code></div>
+</header>
+<main>
+  <div class="card">
+    <div class="row">
+      <div>
+        <label>Wallet ID</label>
+        <input id="walletId" placeholder="uuid" />
+      </div>
+      <div>
+        <label>الرصيد</label>
+        <button id="btnBalance">عرض الرصيد</button>
+        <span id="balance" class="pill"></span>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <div>
+        <label>عملية</label>
+        <select id="op">
+          <option value="deposit">إيداع</option>
+          <option value="withdraw">سحب</option>
+          <option value="transfer">تحويل</option>
+        </select>
+      </div>
+      <div>
+        <label>المبلغ</label>
+        <input id="amount" type="number" step="0.00000001" value="10" />
+      </div>
+      <div id="toWalletWrap" style="display:none">
+        <label>إلى Wallet ID</label>
+        <input id="toWalletId" placeholder="uuid" />
+      </div>
+      <div style="align-self:end">
+        <button id="btnDo">تنفيذ</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <div>
+        <label>تصفية السجل</label>
+        <input id="fltWallet" placeholder="wallet_id (اختياري)" />
+      </div>
+      <div>
+        <label>النوع</label>
+        <select id="fltType">
+          <option value="">الكل</option>
+          <option>create</option><option>deposit</option><option>withdraw</option>
+          <option>transfer_in</option><option>transfer_out</option>
+        </select>
+      </div>
+      <div>
+        <label>من تاريخ</label>
+        <input id="fltFrom" type="datetime-local" />
+      </div>
+      <div>
+        <label>إلى تاريخ</label>
+        <input id="fltTo" type="datetime-local" />
+      </div>
+      <div style="align-self:end">
+        <button id="btnLoad">تحميل</button>
+        <a id="lnkCsv" href="#" target="_blank">تصدير CSV</a>
+      </div>
+    </div>
+    <table id="tbl">
+      <thead><tr><th>الوقت</th><th>المعرف</th><th>Wallet</th><th>النوع</th><th>المبلغ</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</main>
+
+<script>
+const params = new URLSearchParams(location.search);
+const KEY = params.get('key') || '';
+function hdr(){ return {"X-Api-Key": KEY}; }
+function fmt(x){ return new Intl.NumberFormat('en-US',{maximumFractionDigits:8}).format(x); }
+
+const op = document.getElementById('op');
+op.addEventListener('change', ()=>{
+  document.getElementById('toWalletWrap').style.display = (op.value==='transfer')?'block':'none';
+});
+
+document.getElementById('btnBalance').onclick = async ()=>{
+  const id = document.getElementById('walletId').value.trim();
+  if(!id) return alert('Wallet ID?');
+  const r = await fetch(`/wallet/balance?wallet_id=${encodeURIComponent(id)}`, {headers: hdr()});
+  const j = await r.json();
+  document.getElementById('balance').textContent = j.ok ? fmt(j.wallet.balance) : (j.error||'!');
+};
+
+document.getElementById('btnDo').onclick = async ()=>{
+  const id = document.getElementById('walletId').value.trim();
+  const amount = parseFloat(document.getElementById('amount').value||'0');
+  const kind = op.value;
+  let url = '', body = {};
+  if(kind==='transfer'){
+    const toId = document.getElementById('toWalletId').value.trim();
+    url = '/wallet/transfer';
+    body = {from_wallet_id:id, to_wallet_id:toId, amount};
+  }else{
+    url = '/wallet/'+kind;
+    body = {wallet_id:id, amount};
+  }
+  const r = await fetch(url,{method:'POST',headers:{...hdr(),"Content-Type":"application/json"},body:JSON.stringify(body)});
+  const j = await r.json();
+  if(!j.ok) alert(j.error||'خطأ'); else alert('تمت العملية');
+};
+
+document.getElementById('btnLoad').onclick = loadTx;
+async function loadTx(){
+  const w = document.getElementById('fltWallet').value.trim();
+  const t = document.getElementById('fltType').value;
+  const f = document.getElementById('fltFrom').value ? new Date(document.getElementById('fltFrom').value).toISOString() : '';
+  const to = document.getElementById('fltTo').value ? new Date(document.getElementById('fltTo').value).toISOString() : '';
+  const qs = new URLSearchParams();
+  if(w) qs.set('wallet_id', w);
+  if(t) qs.set('type', t);
+  if(f) qs.set('date_from', f);
+  if(to) qs.set('date_to', to);
+
+  const r = await fetch(`/transactions?${qs.toString()}`, {headers: hdr()});
+  const j = await r.json();
+  const tbody = document.querySelector('#tbl tbody');
+  tbody.innerHTML = '';
+  if(j.ok){
+    for(const it of j.items){
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${new Date(it.created_at).toLocaleString()}</td>
+        <td class="muted">${it.id}</td>
+        <td class="muted">${it.wallet_id}</td>
+        <td>${it.type}</td>
+        <td>${fmt(it.amount)}</td>`;
+      tbody.appendChild(tr);
+    }
+  }
+  // CSV link
+  const lnk = document.getElementById('lnkCsv');
+  lnk.href = `/transactions/export.csv?${qs.toString()}`;
+  lnk.onclick = (e)=>{ e.preventDefault(); window.open(lnk.href + (qs.toString()?'&':'?') + 'dl=1', '_blank'); }
+}
+</script>
+</body>
+</html>
+"""
+
+@app.get("/dashboard")
+def dashboard():
+    return render_template_string(DASHBOARD_HTML)
+
+# ------------------------------------------------------------------------------
+# App entry
+# ------------------------------------------------------------------------------
+@app.get("/")
+def home():
+    return jsonify({
+        "ok": True,
+        "name": "nono-wallet",
+        "time": now_utc().isoformat() + "Z",
+        "routes": [str(r) for r in app.url_map.iter_rules()]
+    })
+
+# WSGI entry
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
