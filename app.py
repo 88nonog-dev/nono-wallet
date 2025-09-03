@@ -1,3 +1,205 @@
+import os
+import uuid
+from datetime import datetime
+from flask import Flask, request, jsonify, Response
+from sqlalchemy import create_engine, text
+
+# ------------------------------------------------------------------------------
+# Flask app
+# ------------------------------------------------------------------------------
+app = Flask(__name__)
+application = app  # نحتفظ ب alias لو استخدمنا wsgi:application
+
+# ------------------------------------------------------------------------------
+# Database (Neon Postgres مع fallback SQLite) + إنشاء جداول تلقائي
+# ------------------------------------------------------------------------------
+DATABASE_URL = (os.environ.get("DATABASE_URL") or "").strip()
+
+def _build_engine():
+    url = DATABASE_URL
+    if not url:
+        # fallback محلي لكي لا يطيح السيرفر لو ماكو DATABASE_URL
+        return create_engine("sqlite:///nono_wallet.sqlite3", pool_pre_ping=True)
+    # إجبار SSL مع Neon/Postgres
+    if url.startswith("postgres") and "sslmode" not in url:
+        url = url + ("&" if "?" in url else "?") + "sslmode=require"
+    return create_engine(url, pool_pre_ping=True)
+
+engine = _build_engine()
+
+def ensure_schema():
+    with engine.begin() as conn:
+        conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS wallets (
+            id TEXT PRIMARY KEY,
+            name TEXT UNIQUE,
+            balance NUMERIC NOT NULL DEFAULT 0
+        )"""))
+        conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS transactions (
+            id TEXT PRIMARY KEY,
+            wallet_id TEXT NOT NULL,
+            type TEXT NOT NULL,
+            amount NUMERIC NOT NULL,
+            created_at TIMESTAMP NOT NULL,
+            FOREIGN KEY(wallet_id) REFERENCES wallets(id)
+        )"""))
+
+try:
+    ensure_schema()
+except Exception as e:
+    # لا نطيح السيرفر؛ اللوج فقط
+    print("SCHEMA INIT WARNING:", e)
+
+# ------------------------------------------------------------------------------
+# Security: API Token (X-Api-Key)
+# ------------------------------------------------------------------------------
+API_TOKEN = (os.environ.get("API_TOKEN") or "").strip()
+
+def require_api_key(fn):
+    from functools import wraps
+    @wraps(fn)
+    def _wrap(*a, **kw):
+        token = request.headers.get("X-Api-Key", "")
+        if not API_TOKEN or token != API_TOKEN:
+            return jsonify({"ok": False, "error": "Unauthorized"}), 401
+        return fn(*a, **kw)
+    return _wrap
+
+# ------------------------------------------------------------------------------
+# Health
+# ------------------------------------------------------------------------------
+@app.get("/__ping")
+def __ping():
+    return jsonify({"ok": True, "routes_count": 16})
+
+@app.get("/")
+def home():
+    return jsonify({"ok": True, "name": "nono-wallet", "time": datetime.utcnow().isoformat() + "Z"})
+
+# ------------------------------------------------------------------------------
+# Wallet APIs
+# ------------------------------------------------------------------------------
+@app.post("/wallet/create")
+@require_api_key
+def wallet_create():
+    data = request.get_json(silent=True) or {}
+    name = data.get("name") or f"wallet-{uuid.uuid4().hex[:6]}"
+    wallet_id = str(uuid.uuid4())
+    with engine.begin() as conn:
+        conn.execute(text("INSERT INTO wallets (id, name, balance) VALUES (:id,:name,0)"),
+                     {"id": wallet_id, "name": name})
+        conn.execute(text("""INSERT INTO transactions
+            (id, wallet_id, type, amount, created_at)
+            VALUES (:id,:wid,:typ,:amt,:ts)"""),
+            {"id": str(uuid.uuid4()), "wid": wallet_id, "typ": "create", "amt": 0, "ts": datetime.utcnow()})
+    return jsonify({"ok": True, "wallet": {"id": wallet_id, "name": name, "balance": 0}})
+
+@app.post("/wallet/deposit")
+@require_api_key
+def wallet_deposit():
+    data = request.get_json(silent=True) or {}
+    wallet_id = data.get("wallet_id"); amount = float(data.get("amount") or 0)
+    if not wallet_id or amount <= 0:
+        return jsonify({"ok": False, "error": "wallet_id and positive amount required"}), 400
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE wallets SET balance = balance + :amt WHERE id=:id"),
+                     {"amt": amount, "id": wallet_id})
+        conn.execute(text("""INSERT INTO transactions
+            (id, wallet_id, type, amount, created_at)
+            VALUES (:id,:wid,:typ,:amt,:ts)"""),
+            {"id": str(uuid.uuid4()), "wid": wallet_id, "typ": "deposit", "amt": amount, "ts": datetime.utcnow()})
+    return jsonify({"ok": True})
+
+@app.post("/wallet/withdraw")
+@require_api_key
+def wallet_withdraw():
+    data = request.get_json(silent=True) or {}
+    wallet_id = data.get("wallet_id"); amount = float(data.get("amount") or 0)
+    if not wallet_id or amount <= 0:
+        return jsonify({"ok": False, "error": "wallet_id and positive amount required"}), 400
+    with engine.begin() as conn:
+        bal = conn.execute(text("SELECT balance FROM wallets WHERE id=:id"), {"id": wallet_id}).scalar()
+        if bal is None or float(bal) < amount:
+            return jsonify({"ok": False, "error": "insufficient funds"}), 400
+        conn.execute(text("UPDATE wallets SET balance = balance - :amt WHERE id=:id"),
+                     {"amt": amount, "id": wallet_id})
+        conn.execute(text("""INSERT INTO transactions
+            (id, wallet_id, type, amount, created_at)
+            VALUES (:id,:wid,:typ,:amt,:ts)"""),
+            {"id": str(uuid.uuid4()), "wid": wallet_id, "typ": "withdraw", "amt": amount, "ts": datetime.utcnow()})
+    return jsonify({"ok": True})
+
+@app.get("/wallet/balance")
+@require_api_key
+def wallet_balance():
+    wallet_id = request.args.get("wallet_id")
+    if not wallet_id:
+        return jsonify({"ok": False, "error": "wallet_id required"}), 400
+    with engine.begin() as conn:
+        bal = conn.execute(text("SELECT balance FROM wallets WHERE id=:id"), {"id": wallet_id}).scalar()
+    return jsonify({"ok": True, "wallet": {"id": wallet_id, "balance": float(bal or 0)}})
+
+# ------------------------------------------------------------------------------
+# Transactions list + CSV (مع فلاتر)
+# ------------------------------------------------------------------------------
+@app.get("/transactions")
+@require_api_key
+def transactions_list():
+    wallet_id = request.args.get("wallet_id")
+    date_from = request.args.get("date_from")
+    date_to   = request.args.get("date_to")
+
+    where = ["1=1"]; args = {}
+    if wallet_id:
+        where.append("wallet_id = :wid"); args["wid"] = wallet_id
+    if date_from:
+        where.append("created_at >= :df"); args["df"] = date_from
+    if date_to:
+        where.append("created_at <= :dt"); args["dt"] = date_to
+
+    sql = f"""SELECT id, wallet_id, type, amount, created_at
+              FROM transactions
+              WHERE {' AND '.join(where)}
+              ORDER BY created_at DESC
+              LIMIT 500"""
+    with engine.begin() as conn:
+        rows = conn.execute(text(sql), args).mappings().all()
+    return jsonify({"ok": True, "items": [dict(r) for r in rows]})
+
+@app.get("/transactions/export.csv")
+@require_api_key
+def transactions_export():
+    wallet_id = request.args.get("wallet_id")
+    date_from = request.args.get("date_from")
+    date_to   = request.args.get("date_to")
+
+    where = ["1=1"]; args = {}
+    if wallet_id:
+        where.append("wallet_id = :wid"); args["wid"] = wallet_id
+    if date_from:
+        where.append("created_at >= :df"); args["df"] = date_from
+    if date_to:
+        where.append("created_at <= :dt"); args["dt"] = date_to
+
+    sql = f"""SELECT id, wallet_id, type, amount, created_at
+              FROM transactions
+              WHERE {' AND '.join(where)}
+              ORDER BY created_at DESC"""
+    def gen():
+        yield "id,wallet_id,type,amount,created_at\n"
+        with engine.begin() as conn:
+            for r in conn.execute(text(sql), args):
+                yield f"{r.id},{r.wallet_id},{r.type},{r.amount},{r.created_at}\n"
+    return Response(gen(), mimetype="text/csv")
+
+# ------------------------------------------------------------------------------
+# Dashboard (Purple Wide UI)
+# ------------------------------------------------------------------------------
+@app.get("/dashboard")
+def dashboard():
+    return DASHBOARD_HTML
+
 DASHBOARD_HTML = """<!doctype html><html lang="en" dir="ltr"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Nono Wallet Dashboard</title>
@@ -141,14 +343,12 @@ function setDonut(pct){
   donut.setAttribute("data-label", Math.round(pct)+"%");
 }
 
-// save key
 $("#btnSaveKey").onclick = ()=>{
   localStorage.setItem(LS_KEY, apiKeyEl.value.trim());
   localStorage.setItem(LS_WAL, walletEl.value.trim());
   alert("Saved");
 };
 
-// new tx panel
 $("#btnNewTx").onclick = ()=>$("#newTx").style.display="block";
 $("#txCancel").onclick = ()=>$("#newTx").style.display="none";
 
@@ -160,7 +360,7 @@ async function fetchBalance(){
     const j = await r.json();
     if(j.ok){
       curBal.textContent = fmtMoney(j.wallet.balance||0);
-      const pct = Math.min(100, (Number(j.wallet.balance)||0) / 1000 * 100); // تمثيل تقريبي
+      const pct = Math.min(100, (Number(j.wallet.balance)||0) / 1000 * 100);
       setDonut(pct);
     }
   }catch(e){}
@@ -232,11 +432,9 @@ async function loadTx(){
         tbody.appendChild(tr);
       }
       $("#countLbl").textContent = cnt+" items";
-      // donut نسبة إيداعات من المجموع التقريبي
       const total = dep + wd;
       setDonut(total? (dep/total*100) : 0);
     }
-    // CSV link
     btnCsv.href = `/transactions/export.csv?${qs.toString()}`;
   }catch(e){}
 }
@@ -247,7 +445,6 @@ searchEl.addEventListener("input", ()=>loadTx());
 fromEl.addEventListener("change", ()=>loadTx());
 toEl.addEventListener("change", ()=>loadTx());
 
-// init
 fetchBalance(); loadTx();
 </script>
 </body></html>"""
