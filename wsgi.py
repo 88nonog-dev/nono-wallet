@@ -1,9 +1,8 @@
-# نصدّر متغير اسمه app لأن startCommand يستخدم wsgi:app
+# نُصدر app لأن railway.toml يستخدم startCommand = "gunicorn wsgi:app ..."
 try:
     from app import application as app
 except ImportError:
-    # احتياط إذا عندك متغير app داخل app.py
     from app import app as app
 
-# نُبقي application أيضًا متاح (اختياري)
+# إبقاء alias application (اختياري)
 application = app
