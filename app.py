@@ -2,7 +2,6 @@ import os
 import uuid
 from datetime import datetime
 from flask import Flask, request, jsonify, Response
-
 from sqlalchemy import create_engine, text
 
 # ------------------------------------------------------------------------------
@@ -19,9 +18,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 def build_engine():
     url = DATABASE_URL
     if not url:
-        # fallback محلي حتى ما يطيح السيرفر إذا ماكو DATABASE_URL
         return create_engine("sqlite:///nono_wallet.sqlite3", pool_pre_ping=True)
-    # فرض SSL مع Neon
     if url.startswith("postgres") and "sslmode" not in url:
         if "?" in url:
             url = url + "&sslmode=require"
@@ -31,7 +28,6 @@ def build_engine():
 
 engine = build_engine()
 
-# تأكد من وجود الجداول
 def ensure_schema():
     with engine.begin() as conn:
         conn.execute(text("""
@@ -53,7 +49,6 @@ def ensure_schema():
 try:
     ensure_schema()
 except Exception as e:
-    # لا تطيح التطبيق: خليه يكمل ويخدم /__ping، وباقي المسارات تبين الخطأ
     print("SCHEMA INIT WARNING:", e)
 
 # ------------------------------------------------------------------------------
@@ -72,7 +67,7 @@ def require_api_key(func):
     return wrapper
 
 # ------------------------------------------------------------------------------
-# Healthcheck (لا يلمس DB)
+# Healthcheck
 # ------------------------------------------------------------------------------
 @app.get("/__ping")
 def __ping():
@@ -179,7 +174,7 @@ def transactions_export():
     return Response(gen(), mimetype="text/csv")
 
 # ------------------------------------------------------------------------------
-# Simple Dashboard (مختصر وواسع)
+# Dashboard (light theme)
 # ------------------------------------------------------------------------------
 @app.get("/dashboard")
 def dashboard():
@@ -189,16 +184,23 @@ DASHBOARD_HTML = """<!doctype html><html lang="ar" dir="rtl"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Nono Wallet Dashboard</title>
 <style>
-body{background:#0b0f14;color:#e6edf3;font-family:system-ui,Segoe UI,Arial,sans-serif;margin:0}
-header{padding:24px 32px;border-bottom:1px solid #1f2833;display:flex;justify-content:space-between;align-items:center}
-main{padding:32px;max-width:1500px;margin:0 auto}
-.card{background:#111827;border:1px solid #1f2833;border-radius:18px;padding:22px;margin-bottom:18px}
-input,button{background:#0b1220;color:#e6edf3;border:1px solid #243241;border-radius:12px;padding:12px}
-button{cursor:pointer;background:#0b5cff}
-table{width:100%;border-collapse:collapse;margin-top:14px;font-size:14px}
-th,td{border-bottom:1px solid #243241;padding:10px;text-align:right}
+:root{--bg:#ffffff;--card:#f7f7f9;--line:#e3e5ea;--field:#ffffff;--text:#111827;--muted:#556070}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{background:var(--bg);color:var(--text);font-family:system-ui,Segoe UI,Arial,sans-serif;margin:0}
+header{padding:20px 28px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;background:#fff;position:sticky;top:0;z-index:10}
+main{padding:24px;max-width:1200px;margin:0 auto}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px;margin-bottom:16px}
+label{display:block;margin:6px 0 8px}
+input,select,button{background:var(--field);color:var(--text);border:1px solid #cfd4dc;border-radius:10px;padding:10px 12px}
+input,select{width:100%}
+button{cursor:pointer;background:#2563eb;color:#fff;border-color:#2563eb}
+button.btn-ghost{background:#fff;color:#2563eb;border-color:#cfd4dc}
+table{width:100%;border-collapse:collapse;margin-top:12px;font-size:14px;background:#fff}
+th,td{border-bottom:1px solid #e9edf3;padding:10px;text-align:right;color:#111827}
+a{color:#2563eb}
 </style></head><body>
-<header><h1>نونو-والِت • لوحة التحكم</h1></header>
+<header><h1>نونو-والت • لوحة التحكم</h1></header>
 <main>
   <div class="card">
     <label>API Token</label>
