@@ -1,220 +1,253 @@
-import os
-import uuid
-from datetime import datetime
-from flask import Flask, request, jsonify, Response
-from sqlalchemy import create_engine, text
-
-# ------------------------------------------------------------------------------
-# Flask app
-# ------------------------------------------------------------------------------
-app = Flask(__name__)
-application = app  # Alias for gunicorn
-
-# ------------------------------------------------------------------------------
-# Database engine (robust)
-# ------------------------------------------------------------------------------
-DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
-
-def build_engine():
-    url = DATABASE_URL
-    if not url:
-        return create_engine("sqlite:///nono_wallet.sqlite3", pool_pre_ping=True)
-    if url.startswith("postgres") and "sslmode" not in url:
-        if "?" in url:
-            url = url + "&sslmode=require"
-        else:
-            url = url + "?sslmode=require"
-    return create_engine(url, pool_pre_ping=True)
-
-engine = build_engine()
-
-def ensure_schema():
-    with engine.begin() as conn:
-        conn.execute(text("""
-        CREATE TABLE IF NOT EXISTS wallets (
-            id TEXT PRIMARY KEY,
-            name TEXT UNIQUE,
-            balance NUMERIC NOT NULL DEFAULT 0
-        )"""))
-        conn.execute(text("""
-        CREATE TABLE IF NOT EXISTS transactions (
-            id TEXT PRIMARY KEY,
-            wallet_id TEXT NOT NULL,
-            type TEXT NOT NULL,
-            amount NUMERIC NOT NULL,
-            created_at TIMESTAMP NOT NULL,
-            FOREIGN KEY(wallet_id) REFERENCES wallets(id)
-        )"""))
-
-try:
-    ensure_schema()
-except Exception as e:
-    print("SCHEMA INIT WARNING:", e)
-
-# ------------------------------------------------------------------------------
-# Security: API Token
-# ------------------------------------------------------------------------------
-API_TOKEN = os.environ.get("API_TOKEN", "").strip()
-
-def require_api_key(func):
-    from functools import wraps
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        token = request.headers.get("X-Api-Key", "")
-        if not API_TOKEN or token != API_TOKEN:
-            return jsonify({"ok": False, "error": "Unauthorized"}), 401
-        return func(*args, **kwargs)
-    return wrapper
-
-# ------------------------------------------------------------------------------
-# Healthcheck
-# ------------------------------------------------------------------------------
-@app.get("/__ping")
-def __ping():
-    return jsonify({"ok": True})
-
-@app.get("/health")
-def health():
-    return jsonify({"ok": True, "time": datetime.utcnow().isoformat() + "Z"})
-
-# ------------------------------------------------------------------------------
-# Wallet APIs
-# ------------------------------------------------------------------------------
-@app.post("/wallet/create")
-@require_api_key
-def wallet_create():
-    data = request.get_json(silent=True) or {}
-    name = data.get("name") or f"wallet-{uuid.uuid4().hex[:6]}"
-    wallet_id = str(uuid.uuid4())
-    with engine.begin() as conn:
-        conn.execute(text("INSERT INTO wallets (id, name, balance) VALUES (:id, :name, 0)"),
-                     {"id": wallet_id, "name": name})
-        conn.execute(text("""INSERT INTO transactions
-            (id, wallet_id, type, amount, created_at)
-            VALUES (:id,:wallet_id,:type,:amount,:ts)"""),
-            {"id": str(uuid.uuid4()), "wallet_id": wallet_id, "type": "create", "amount": 0,
-             "ts": datetime.utcnow()})
-    return jsonify({"ok": True, "wallet": {"id": wallet_id, "name": name, "balance": 0}})
-
-@app.post("/wallet/deposit")
-@require_api_key
-def wallet_deposit():
-    data = request.get_json(silent=True) or {}
-    wallet_id = data.get("wallet_id")
-    amount = float(data.get("amount") or 0)
-    if not wallet_id or amount <= 0:
-        return jsonify({"ok": False, "error": "wallet_id and positive amount required"}), 400
-    with engine.begin() as conn:
-        conn.execute(text("UPDATE wallets SET balance = balance + :amt WHERE id=:id"),
-                     {"amt": amount, "id": wallet_id})
-        conn.execute(text("""INSERT INTO transactions
-            (id, wallet_id, type, amount, created_at)
-            VALUES (:id,:wallet_id,:type,:amount,:ts)"""),
-            {"id": str(uuid.uuid4()), "wallet_id": wallet_id, "type": "deposit", "amount": amount,
-             "ts": datetime.utcnow()})
-    return jsonify({"ok": True})
-
-@app.post("/wallet/withdraw")
-@require_api_key
-def wallet_withdraw():
-    data = request.get_json(silent=True) or {}
-    wallet_id = data.get("wallet_id")
-    amount = float(data.get("amount") or 0)
-    if not wallet_id or amount <= 0:
-        return jsonify({"ok": False, "error": "wallet_id and positive amount required"}), 400
-    with engine.begin() as conn:
-        bal = conn.execute(text("SELECT balance FROM wallets WHERE id=:id"),
-                           {"id": wallet_id}).scalar()
-        if bal is None or float(bal) < amount:
-            return jsonify({"ok": False, "error": "insufficient funds"}), 400
-        conn.execute(text("UPDATE wallets SET balance = balance - :amt WHERE id=:id"),
-                     {"amt": amount, "id": wallet_id})
-        conn.execute(text("""INSERT INTO transactions
-            (id, wallet_id, type, amount, created_at)
-            VALUES (:id,:wallet_id,:type,:amount,:ts)"""),
-            {"id": str(uuid.uuid4()), "wallet_id": wallet_id, "type": "withdraw", "amount": amount,
-             "ts": datetime.utcnow()})
-    return jsonify({"ok": True})
-
-@app.get("/wallet/balance")
-@require_api_key
-def wallet_balance():
-    wallet_id = request.args.get("wallet_id")
-    if not wallet_id:
-        return jsonify({"ok": False, "error": "wallet_id required"}), 400
-    with engine.begin() as conn:
-        bal = conn.execute(text("SELECT balance FROM wallets WHERE id=:id"),
-                           {"id": wallet_id}).scalar()
-    return jsonify({"ok": True, "wallet": {"id": wallet_id, "balance": float(bal or 0)}})
-
-@app.get("/transactions")
-@require_api_key
-def transactions_list():
-    with engine.begin() as conn:
-        rows = conn.execute(text("""
-            SELECT id, wallet_id, type, amount, created_at
-            FROM transactions
-            ORDER BY created_at DESC
-            LIMIT 200
-        """)).mappings().all()
-    return jsonify({"ok": True, "items": [dict(r) for r in rows]})
-
-@app.get("/transactions/export.csv")
-@require_api_key
-def transactions_export():
-    def gen():
-        yield "id,wallet_id,type,amount,created_at\n"
-        with engine.begin() as conn:
-            for r in conn.execute(text("""
-                SELECT id, wallet_id, type, amount, created_at
-                FROM transactions
-                ORDER BY created_at DESC
-            """)):
-                yield f"{r.id},{r.wallet_id},{r.type},{r.amount},{r.created_at}\n"
-    return Response(gen(), mimetype="text/csv")
-
-# ------------------------------------------------------------------------------
-# Dashboard (light theme)
-# ------------------------------------------------------------------------------
-@app.get("/dashboard")
-def dashboard():
-    return DASHBOARD_HTML
-
-DASHBOARD_HTML = """<!doctype html><html lang="ar" dir="rtl"><head>
+DASHBOARD_HTML = """<!doctype html><html lang="en" dir="ltr"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Nono Wallet Dashboard</title>
 <style>
-:root{--bg:#ffffff;--card:#f7f7f9;--line:#e3e5ea;--field:#ffffff;--text:#111827;--muted:#556070}
-*{box-sizing:border-box}
-html,body{height:100%}
-body{background:var(--bg);color:var(--text);font-family:system-ui,Segoe UI,Arial,sans-serif;margin:0}
-header{padding:20px 28px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;background:#fff;position:sticky;top:0;z-index:10}
-main{padding:24px;max-width:1200px;margin:0 auto}
-.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px;margin-bottom:16px}
-label{display:block;margin:6px 0 8px}
-input,select,button{background:var(--field);color:var(--text);border:1px solid #cfd4dc;border-radius:10px;padding:10px 12px}
-input,select{width:100%}
-button{cursor:pointer;background:#2563eb;color:#fff;border-color:#2563eb}
-button.btn-ghost{background:#fff;color:#2563eb;border-color:#cfd4dc}
-table{width:100%;border-collapse:collapse;margin-top:12px;font-size:14px;background:#fff}
-th,td{border-bottom:1px solid #e9edf3;padding:10px;text-align:right;color:#111827}
-a{color:#2563eb}
-</style></head><body>
-<header><h1>نونو-والت • لوحة التحكم</h1></header>
-<main>
-  <div class="card">
-    <label>API Token</label>
-    <input id="apiKey" placeholder="ضع التوكن هنا" />
-    <button onclick="localStorage.setItem('key',document.getElementById('apiKey').value);alert('Saved')">حفظ</button>
-  </div>
-  <div class="card">
-    <button onclick="fetch('/wallet/create',{method:'POST',headers:{'X-Api-Key':localStorage.getItem('key'),'Content-Type':'application/json'},body:'{\"name\":\"main\"}'}).then(r=>r.json()).then(j=>alert(JSON.stringify(j)))">إنشاء محفظة</button>
-  </div>
-</main></body></html>"""
+  :root{
+    --bg1:#6a11cb; --bg2:#2575fc;
+    --card:#ffffff; --line:#e6e8ef; --text:#0f172a; --muted:#667085;
+    --primary:#6a11cb; --primary2:#7b3efc; --ok:#16a34a; --warn:#f59e0b; --err:#ef4444;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:linear-gradient(135deg,var(--bg1),var(--bg2)) fixed;min-height:100vh;
+       font-family:system-ui,Segoe UI,Arial,sans-serif;color:var(--text)}
+  header{padding:22px 28px;color:#fff;display:flex;align-items:center;justify-content:space-between}
+  header h1{margin:0;font-size:20px;font-weight:700}
+  main{max-width:1200px;margin:0 auto;padding:20px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:16px;box-shadow:0 8px 24px rgba(0,0,0,.12)}
+  .hero{display:grid;grid-template-columns:1.4fr .8fr;gap:18px;padding:24px}
+  .hero .balance{color:#fff;background:linear-gradient(135deg,rgba(255,255,255,.15),rgba(255,255,255,.05));
+     border-radius:18px;padding:22px;border:1px solid rgba(255,255,255,.25);backdrop-filter:blur(4px)}
+  .hero h2{margin:0 0 8px 0;color:#fff;opacity:.95;font-weight:600}
+  .hero .val{font-size:42px;font-weight:800;letter-spacing:.5px;color:#fff;margin:6px 0 16px 0}
+  .hero .actions{display:flex;gap:10px;flex-wrap:wrap}
+  .btn{border:1px solid #cfd4dc;border-radius:12px;padding:10px 14px;background:#fff;cursor:pointer}
+  .btn.primary{background:linear-gradient(135deg,var(--primary),var(--primary2));border:none;color:#fff}
+  .btn.ghost{background:#fff;border-color:#d9dbe3;color:var(--primary)}
+  .chip{border-radius:999px;background:#fff;border:1px solid #d9dbe3;padding:8px 12px}
+  .panel{padding:16px 18px}
+  .row{display:flex;gap:12px;flex-wrap:wrap}
+  .row>*{flex:1;min-width:190px}
+  input,select{width:100%;border:1px solid #cfd4dc;background:#fff;color:var(--text);border-radius:12px;padding:10px 12px}
+  table{width:100%;border-collapse:collapse;background:#fff}
+  th,td{padding:12px;border-bottom:1px solid #eef0f5;text-align:left}
+  th{color:#334155;font-weight:600}
+  .status{display:inline-flex;align-items:center;gap:8px}
+  .dot{width:10px;height:10px;border-radius:50%}
+  .ok{background:var(--ok)} .pen{background:var(--warn)} .bad{background:var(--err)}
+  .pill{display:inline-block;padding:6px 10px;border-radius:999px;border:1px solid #e2e7f0;background:#f8fafc;font-size:12px}
+  .footer{color:#e5e7eb;text-align:center;padding:22px 10px}
+  .klabel{color:#e5e7eb;font-size:12px}
+  .donut{width:180px;height:180px;background:
+      radial-gradient(closest-side, #0000 74%, #0000 0),
+      conic-gradient(#7c3aed var(--pct), #ddd 0);
+      border-radius:50%;position:relative;border:1px solid rgba(255,255,255,.25)}
+  .donut::after{content:attr(data-label);position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+      color:#fff;font-weight:700;font-size:18px}
+  .grid{display:grid;grid-template-columns:1fr;gap:16px}
+  @media(min-width:900px){ .grid{grid-template-columns:1fr 1fr} }
+</style>
+</head>
+<body>
+  <header>
+    <h1>نونو-والِت • لوحة التحكم</h1>
+    <div class="klabel">استخدم هيدر <b>X-Api-Key</b> (يحفظ محليًا)</div>
+  </header>
 
-@app.get("/")
-def home():
-    return jsonify({"ok": True, "name": "nono-wallet", "time": datetime.utcnow().isoformat() + "Z"})
+  <main>
+    <!-- HERO -->
+    <section class="card hero" id="hero">
+      <div class="balance">
+        <h2>Current Balance</h2>
+        <div class="val" id="curBal">$0.00</div>
+        <div class="actions">
+          <button class="btn primary" id="btnDeposit">+ Deposit</button>
+          <button class="btn" id="btnWithdraw">Withdrawal</button>
+          <span class="chip" id="chipOver500">&gt; 500</span>
+        </div>
+      </div>
+      <div class="balance" style="display:flex;align-items:center;justify-content:center">
+        <div id="donut" class="donut" style="--pct:0deg" data-label="0%"></div>
+      </div>
+    </section>
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
+    <!-- FILTERS -->
+    <section class="card panel">
+      <div class="row">
+        <input id="apiKey" placeholder="API Token" />
+        <input id="walletId" placeholder="Wallet ID (uuid)" />
+        <input id="dateFrom" type="date" />
+        <input id="dateTo" type="date" />
+        <input id="searchTxt" placeholder="Search (type, id...)" />
+        <div style="display:flex;gap:10px;align-items:center;justify-content:flex-end">
+          <button class="btn" id="btnSaveKey">Save</button>
+          <a class="btn ghost" id="btnCsv" href="#">Export CSV</a>
+          <button class="btn primary" id="btnNewTx">+ New Transaction</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- TABLE -->
+    <section class="card panel">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+        <h3 style="margin:0">Transactions</h3>
+        <span class="pill" id="countLbl">0 items</span>
+      </div>
+      <div style="overflow:auto">
+        <table id="tbl">
+          <thead><tr><th>Date</th><th>Type</th><th>Amount</th><th>Status</th><th>ID</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- NEW TX PANEL -->
+    <section class="card panel" id="newTx" style="display:none">
+      <div class="row">
+        <select id="txType">
+          <option value="deposit">Deposit</option>
+          <option value="withdraw">Withdrawal</option>
+        </select>
+        <input id="txAmount" type="number" min="0" step="0.00000001" placeholder="Amount" />
+        <button class="btn primary" id="txDo">Submit</button>
+        <button class="btn" id="txCancel">Cancel</button>
+      </div>
+      <div id="txMsg" style="margin-top:10px;color:var(--muted)"></div>
+    </section>
+
+    <div class="footer">© nono-wallet</div>
+  </main>
+
+<script>
+const $ = s=>document.querySelector(s);
+const tbody = $("#tbl tbody");
+const apiKeyEl = $("#apiKey");
+const walletEl = $("#walletId");
+const fromEl = $("#dateFrom");
+const toEl = $("#dateTo");
+const searchEl = $("#searchTxt");
+const donut = $("#donut");
+const curBal = $("#curBal");
+const btnCsv = $("#btnCsv");
+
+const LS_KEY="nono_api_key", LS_WAL="nono_last_wallet";
+apiKeyEl.value = localStorage.getItem(LS_KEY)||"";
+walletEl.value = localStorage.getItem(LS_WAL)||"";
+
+function hdr(){ return {"X-Api-Key": apiKeyEl.value.trim() }; }
+function fmtMoney(n){ return new Intl.NumberFormat("en-US",{style:"currency",currency:"USD",maximumFractionDigits:8}).format(Number(n)||0); }
+function setDonut(pct){
+  const deg = Math.max(0,Math.min(100,pct))*3.6;
+  donut.style.setProperty("--pct", deg+"deg");
+  donut.setAttribute("data-label", Math.round(pct)+"%");
+}
+
+// save key
+$("#btnSaveKey").onclick = ()=>{
+  localStorage.setItem(LS_KEY, apiKeyEl.value.trim());
+  localStorage.setItem(LS_WAL, walletEl.value.trim());
+  alert("Saved");
+};
+
+// new tx panel
+$("#btnNewTx").onclick = ()=>$("#newTx").style.display="block";
+$("#txCancel").onclick = ()=>$("#newTx").style.display="none";
+
+async function fetchBalance(){
+  const id = walletEl.value.trim();
+  if(!id) return;
+  try{
+    const r = await fetch(`/wallet/balance?wallet_id=${encodeURIComponent(id)}`, {headers: hdr()});
+    const j = await r.json();
+    if(j.ok){
+      curBal.textContent = fmtMoney(j.wallet.balance||0);
+      const pct = Math.min(100, (Number(j.wallet.balance)||0) / 1000 * 100); // تمثيل تقريبي
+      setDonut(pct);
+    }
+  }catch(e){}
+}
+
+async function depositWithdraw(kind, amount){
+  const id = walletEl.value.trim();
+  if(!id) return alert("Wallet ID required");
+  if(!(amount>0)) return alert("Amount must be > 0");
+  const url = (kind==="deposit")?"/wallet/deposit":"/wallet/withdraw";
+  const r = await fetch(url,{method:"POST",headers:{...hdr(),"Content-Type":"application/json"},
+      body: JSON.stringify({wallet_id:id, amount:Number(amount)})});
+  const j = await r.json();
+  if(!j.ok) alert(j.error||"Error"); else { await fetchBalance(); await loadTx(); }
+}
+
+$("#btnDeposit").onclick = ()=>{ $("#newTx").style.display="block"; $("#txType").value="deposit"; }
+$("#btnWithdraw").onclick = ()=>{ $("#newTx").style.display="block"; $("#txType").value="withdraw"; }
+$("#txDo").onclick = async ()=>{
+  const t = $("#txType").value, amt = Number($("#txAmount").value||0);
+  $("#txMsg").textContent = "Processing...";
+  await depositWithdraw(t, amt);
+  $("#txMsg").textContent = "Done";
+};
+
+$("#chipOver500").onclick = ()=>{ searchEl.value=">500"; loadTx(); };
+
+function matchSearch(it){
+  const q = (searchEl.value||"").trim();
+  if(!q) return true;
+  if(q.startsWith(">")){
+    const n = Number(q.slice(1));
+    return (Number(it.amount)||0) > n;
+  }
+  const s = q.toLowerCase();
+  return (it.id+it.type+it.wallet_id).toLowerCase().includes(s);
+}
+
+async function loadTx(){
+  const qs = new URLSearchParams();
+  const w = walletEl.value.trim();
+  if(w) qs.set("wallet_id", w);
+  const f = fromEl.value ? new Date(fromEl.value).toISOString() : "";
+  const t = toEl.value   ? new Date(toEl.value).toISOString()   : "";
+  if(f) qs.set("date_from", f);
+  if(t) qs.set("date_to", t);
+
+  try{
+    const r = await fetch(`/transactions?${qs.toString()}`, {headers: hdr()});
+    const j = await r.json();
+    tbody.innerHTML = "";
+    let cnt=0, dep=0, wd=0;
+    if(j.ok){
+      const items = (j.items||[]).filter(matchSearch);
+      for(const it of items){
+        cnt++;
+        if(it.type==="deposit") dep+=Number(it.amount)||0;
+        if(it.type==="withdraw") wd+=Number(it.amount)||0;
+
+        const tr = document.createElement("tr");
+        const status = (it.type==="withdraw"||it.type==="deposit") ? "Completed" : "Pending";
+        const cls = status==="Completed" ? "ok" : "pen";
+        tr.innerHTML = `
+          <td>${new Date(it.created_at).toLocaleString()}</td>
+          <td style="color:${it.type==='withdraw'?'#b42318':'#0f766e'}">${it.type}</td>
+          <td>${fmtMoney(it.amount)}</td>
+          <td><span class="status"><span class="dot ${cls}"></span>${status}</span></td>
+          <td style="color:#64748b">${it.id}</td>`;
+        tbody.appendChild(tr);
+      }
+      $("#countLbl").textContent = cnt+" items";
+      // donut نسبة إيداعات من المجموع التقريبي
+      const total = dep + wd;
+      setDonut(total? (dep/total*100) : 0);
+    }
+    // CSV link
+    btnCsv.href = `/transactions/export.csv?${qs.toString()}`;
+  }catch(e){}
+}
+
+apiKeyEl.addEventListener("change", ()=>localStorage.setItem(LS_KEY, apiKeyEl.value.trim()));
+walletEl.addEventListener("change", ()=>{ localStorage.setItem(LS_WAL, walletEl.value.trim()); fetchBalance(); loadTx(); });
+searchEl.addEventListener("input", ()=>loadTx());
+fromEl.addEventListener("change", ()=>loadTx());
+toEl.addEventListener("change", ()=>loadTx());
+
+// init
+fetchBalance(); loadTx();
+</script>
+</body></html>"""
