@@ -1,17 +1,25 @@
+# ------------------------------------------------------------
+# Project: nono-wallet
+# Author: Mohammed Nasser Zimam (محمد ناصر زمام)
+# Company: شركة الصقر الملكي للمقاولات العامة
+# Year: 2025
+# Note: ملف تشغيل رئيسي (Flask) جاهز لـ Railway
+# ------------------------------------------------------------
+
 import os
 import uuid
 from datetime import datetime
-from flask import Flask, request, jsonify, Response, abort  # ← أضفنا abort
+from flask import Flask, request, jsonify, Response, abort
 from sqlalchemy import create_engine, text
 
 # ------------------------------------------------------------------------------
 # Flask app
 # ------------------------------------------------------------------------------
 app = Flask(__name__)
-application = app  # نحتفظ ب alias لو استخدمنا wsgi:application
+application = app  # alias إذا استعملت wsgi:application
 
 # ------------------------------------------------------------------------------
-# Database (Neon Postgres مع fallback SQLite) + إنشاء جداول تلقائي
+# Database (Neon Postgres مع fallback SQLite) + إنشاء/ترقية سكيمة
 # ------------------------------------------------------------------------------
 DATABASE_URL = (os.environ.get("DATABASE_URL") or "").strip()
 
@@ -26,14 +34,21 @@ def _build_engine():
     return create_engine(url, pool_pre_ping=True)
 
 engine = _build_engine()
+
 def ensure_schema():
+    """
+    تضمن وجود الجداول الأساسية، وتُرقّي جدول wallets لإضافة العمود name إذا كان مفقود.
+    ملاحظة: CREATE TABLE IF NOT EXISTS لا يحدّث الجداول القائمة،
+    لذا نستخدم فحص information_schema (لـ Postgres) أو PRAGMA (لـ SQLite).
+    """
     with engine.begin() as conn:
-        # إنشاء أولي (ما يحدّث جدول موجود)
+        # إنشاء الجداول إن لم تكن موجودة (لا يحدّث الجداول القديمة)
         conn.execute(text("""
         CREATE TABLE IF NOT EXISTS wallets (
             id TEXT PRIMARY KEY,
             balance NUMERIC NOT NULL DEFAULT 0
         )"""))
+
         conn.execute(text("""
         CREATE TABLE IF NOT EXISTS transactions (
             id TEXT PRIMARY KEY,
@@ -44,49 +59,35 @@ def ensure_schema():
             FOREIGN KEY(wallet_id) REFERENCES wallets(id)
         )"""))
 
-        # 🔧 ترقية السكيمة: إضافة العمود name إذا مفقود
+        # ترقية السكيمة: إضافة wallets.name إذا كان مفقود
         try:
-            # Postgres/Neon
-            conn.execute(text("ALTER TABLE wallets ADD COLUMN IF NOT EXISTS name TEXT UNIQUE"))
+            # تحقق لِـ Postgres/Neon عبر information_schema
+            exists = conn.execute(
+                text("SELECT 1 FROM information_schema.columns WHERE table_name='wallets' AND column_name='name'")
+            ).scalar()
+            if not exists:
+                conn.execute(text("ALTER TABLE wallets ADD COLUMN name TEXT UNIQUE"))
         except Exception:
-            # SQLite قديم ممكن ما يدعم IF NOT EXISTS
+            # Fallback لـ SQLite
             try:
                 res = conn.execute(text("PRAGMA table_info(wallets)")).mappings().all()
                 has_name = any(r.get("name") == "name" for r in res)
                 if not has_name:
                     conn.execute(text("ALTER TABLE wallets ADD COLUMN name TEXT UNIQUE"))
-            except Exception as _:
-                print("SCHEMA ALTER WARNING:", _)
-
-def ensure_schema():
-    with engine.begin() as conn:
-        conn.execute(text("""
-        CREATE TABLE IF NOT EXISTS wallets (
-            id TEXT PRIMARY KEY,
-            name TEXT UNIQUE,
-            balance NUMERIC NOT NULL DEFAULT 0
-        )"""))
-        conn.execute(text("""
-        CREATE TABLE IF NOT EXISTS transactions (
-            id TEXT PRIMARY KEY,
-            wallet_id TEXT NOT NULL,
-            type TEXT NOT NULL,
-            amount NUMERIC NOT NULL,
-            created_at TIMESTAMP NOT NULL,
-            FOREIGN KEY(wallet_id) REFERENCES wallets(id)
-        )"""))
+            except Exception as e:
+                print("SCHEMA ALTER WARNING:", e)
 
 try:
     ensure_schema()
 except Exception as e:
     # لا نطيح السيرفر؛ اللوج فقط
-    print("SCHEMA INIT WARNING:", e)
+    print("SCHEMA INIT/UPGRADE WARNING:", e)
 
 # ------------------------------------------------------------------------------
 # Security: API Token (X-Api-Key) + WHOAMI_TOKEN
 # ------------------------------------------------------------------------------
 API_TOKEN = (os.environ.get("API_TOKEN") or "").strip()
-WHOAMI_TOKEN = (os.environ.get("WHOAMI_TOKEN") or "").strip()  # ← أضفنا هذا
+WHOAMI_TOKEN = (os.environ.get("WHOAMI_TOKEN") or "").strip()
 
 def require_api_key(fn):
     from functools import wraps
@@ -103,24 +104,22 @@ def require_api_key(fn):
 # ------------------------------------------------------------------------------
 @app.get("/__ping")
 def __ping():
-    # نحسب عدد الراوتات ديناميكياً حتى يبقى صحيح حتى مع الإضافات
     routes = [r.rule for r in app.url_map.iter_rules() if r.endpoint != 'static']
     return jsonify({"ok": True, "routes_count": len(routes), "routes": routes})
 
-@app.get("/health")  # ← أضفنا هذا
+@app.get("/health")
 def health():
     return jsonify({"ok": True, "name": "nono-wallet", "time": datetime.utcnow().isoformat() + "Z"})
 
-@app.get("/whoami")  # ← أضفنا هذا
+@app.get("/whoami")
 def whoami():
-    required = WHOAMI_TOKEN.strip()
+    required = (WHOAMI_TOKEN or "").strip()
     sent = (request.headers.get("X-Auth-Token") or "").strip()
     if not required:
-        # نخليها فاشلة بوضوح إذا ما مكوّن التوكن
         return jsonify({"ok": False, "error": "WHOAMI_TOKEN not configured"}), 500
     if sent != required:
         abort(401)
-    return jsonify({"ok": True, "user": "nono-wallet", "env": os.getenv("RAILWAY_ENVIRONMENT_NAME", "local")})
+    return jsonify({"ok": True, "user": "nono-wallet", "env": os.getenv("RAILWAY_ENVIRONMENT_NAME", "production")})
 
 @app.get("/")
 def home():
@@ -278,7 +277,7 @@ DASHBOARD_HTML = """<!doctype html><html lang="en" dir="ltr"><head>
   .panel{padding:16px 18px}
   .row{display:flex;gap:12px;flex-wrap:wrap}
   .row>*{flex:1;min-width:190px}
-  input,select{width:100%;border:1px solid #cfd4dc;background:#fff;color:var(--text);border-radius:12px;padding:10px 12px}
+  input,select{width:100%;border:1px solid #cfd4dc;background:#fff;color:#0f172a;border-radius:12px;padding:10px 12px}
   table{width:100%;border-collapse:collapse;background:#fff}
   th,td{padding:12px;border-bottom:1px solid #eef0f5;text-align:left}
   th{color:#334155;font-weight:600}
@@ -294,8 +293,6 @@ DASHBOARD_HTML = """<!doctype html><html lang="en" dir="ltr"><head>
       border-radius:50%;position:relative;border:1px solid rgba(255,255,255,.25)}
   .donut::after{content:attr(data-label);position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
       color:#fff;font-weight:700;font-size:18px}
-  .grid{display:grid;grid-template-columns:1fr;gap:16px}
-  @media(min-width:900px){ .grid{grid-template-columns:1fr 1fr} }
 </style>
 </head>
 <body>
@@ -362,7 +359,7 @@ DASHBOARD_HTML = """<!doctype html><html lang="en" dir="ltr"><head>
         <button class="btn primary" id="txDo">Submit</button>
         <button class="btn" id="txCancel">Cancel</button>
       </div>
-      <div id="txMsg" style="margin-top:10px;color:var(--muted)"></div>
+      <div id="txMsg" style="margin-top:10px;color:#667085"></div>
     </section>
 
     <div class="footer">© nono-wallet</div>
