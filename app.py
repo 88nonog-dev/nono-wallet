@@ -38,8 +38,8 @@ engine = _build_engine()
 def ensure_schema():
     """
     تضمن وجود الجداول الأساسية، وتُرقّي جدول wallets لإضافة العمود name إذا كان مفقود.
-    ملاحظة: CREATE TABLE IF NOT EXISTS لا يحدّث الجداول القائمة،
-    لذا نستخدم فحص information_schema (لـ Postgres) أو PRAGMA (لـ SQLite).
+    CREATE TABLE IF NOT EXISTS لا يحدّث الجداول القائمة، لذلك نفحص information_schema (لـ Postgres)
+    أو PRAGMA (لـ SQLite).
     """
     with engine.begin() as conn:
         # إنشاء الجداول إن لم تكن موجودة (لا يحدّث الجداول القديمة)
@@ -61,9 +61,9 @@ def ensure_schema():
 
         # ترقية السكيمة: إضافة wallets.name إذا كان مفقود
         try:
-            # تحقق لِـ Postgres/Neon عبر information_schema
+            # Postgres/Neon عبر information_schema
             exists = conn.execute(
-                text("SELECT 1 FROM information_schema.columns WHERE table_name='wallets' AND column_name='name'")
+                text("SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name='wallets' AND column_name='name'")
             ).scalar()
             if not exists:
                 conn.execute(text("ALTER TABLE wallets ADD COLUMN name TEXT UNIQUE"))
@@ -134,13 +134,48 @@ def wallet_create():
     data = request.get_json(silent=True) or {}
     name = data.get("name") or f"wallet-{uuid.uuid4().hex[:6]}"
     wallet_id = str(uuid.uuid4())
+
     with engine.begin() as conn:
-        conn.execute(text("INSERT INTO wallets (id, name, balance) VALUES (:id,:name,0)"),
-                     {"id": wallet_id, "name": name})
-        conn.execute(text("""INSERT INTO transactions
-            (id, wallet_id, type, amount, created_at)
-            VALUES (:id,:wid,:typ,:amt,:ts)"""),
-            {"id": str(uuid.uuid4()), "wid": wallet_id, "typ": "create", "amt": 0, "ts": datetime.utcnow()})
+        # 1) محاولة إضافة العمود name إذا مفقود (Self-heal)
+        try:
+            conn.execute(text("ALTER TABLE wallets ADD COLUMN IF NOT EXISTS name TEXT UNIQUE"))
+        except Exception:
+            # إذا DB ما تدعم IF NOT EXISTS نتجاهل
+            try:
+                # SQLite check
+                res = conn.execute(text("PRAGMA table_info(wallets)")).mappings().all()
+                has_name = any(r.get("name") == "name" for r in res)
+                if not has_name:
+                    conn.execute(text("ALTER TABLE wallets ADD COLUMN name TEXT UNIQUE"))
+            except Exception:
+                pass
+
+        # 2) إدراج مع الاسم، ولو فشل (مثلاً لعدم وجود العمود) نعمل fallback
+        try:
+            conn.execute(
+                text("INSERT INTO wallets (id, name, balance) VALUES (:id, :name, 0)"),
+                {"id": wallet_id, "name": name},
+            )
+        except Exception:
+            conn.execute(
+                text("INSERT INTO wallets (id, balance) VALUES (:id, 0)"),
+                {"id": wallet_id},
+            )
+
+        # 3) تسجيل معاملة الإنشاء
+        conn.execute(
+            text("""INSERT INTO transactions
+                    (id, wallet_id, type, amount, created_at)
+                    VALUES (:id,:wid,:typ,:amt,:ts)"""),
+            {
+                "id": str(uuid.uuid4()),
+                "wid": wallet_id,
+                "typ": "create",
+                "amt": 0,
+                "ts": datetime.utcnow(),
+            },
+        )
+
     return jsonify({"ok": True, "wallet": {"id": wallet_id, "name": name, "balance": 0}})
 
 @app.post("/wallet/deposit")
@@ -259,7 +294,7 @@ DASHBOARD_HTML = """<!doctype html><html lang="en" dir="ltr"><head>
   }
   *{box-sizing:border-box}
   body{margin:0;background:linear-gradient(135deg,var(--bg1),var(--bg2)) fixed;min-height:100vh;
-       font-family:system-ui,Segoe UI,Arial,sans-serif;color:var(--text)}
+       font-family:system-ui,Segoe UI,Arial,sans-serif;color:#0f172a}
   header{padding:22px 28px;color:#fff;display:flex;align-items:center;justify-content:space-between}
   header h1{margin:0;font-size:20px;font-weight:700}
   main{max-width:1200px;margin:0 auto;padding:20px}
