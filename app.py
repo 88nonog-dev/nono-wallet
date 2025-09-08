@@ -136,33 +136,24 @@ def wallet_create():
     wallet_id = str(uuid.uuid4())
 
     with engine.begin() as conn:
-        # 1) محاولة إضافة العمود name إذا مفقود (Self-heal)
-        try:
-            conn.execute(text("ALTER TABLE wallets ADD COLUMN IF NOT EXISTS name TEXT UNIQUE"))
-        except Exception:
-            # إذا DB ما تدعم IF NOT EXISTS نتجاهل
-            try:
-                # SQLite check
-                res = conn.execute(text("PRAGMA table_info(wallets)")).mappings().all()
-                has_name = any(r.get("name") == "name" for r in res)
-                if not has_name:
-                    conn.execute(text("ALTER TABLE wallets ADD COLUMN name TEXT UNIQUE"))
-            except Exception:
-                pass
+        # (A) إدراج آمن بدون الاعتماد على عمود name
+        conn.execute(
+            text("INSERT INTO wallets (id, balance) VALUES (:id, 0)"),
+            {"id": wallet_id},
+        )
 
-        # 2) إدراج مع الاسم، ولو فشل (مثلاً لعدم وجود العمود) نعمل fallback
+        # (B) محاولة ضبط الاسم إذا كان العمود موجود
         try:
+            # Postgres: إذا العمود موجود يتحدث؛ لو مو موجود راح يرمي UndefinedColumn فنطنشه
             conn.execute(
-                text("INSERT INTO wallets (id, name, balance) VALUES (:id, :name, 0)"),
+                text("UPDATE wallets SET name = :name WHERE id = :id"),
                 {"id": wallet_id, "name": name},
             )
         except Exception:
-            conn.execute(
-                text("INSERT INTO wallets (id, balance) VALUES (:id, 0)"),
-                {"id": wallet_id},
-            )
+            # نتجاهل الخطأ — يبقى الجدول يشتغل بدون الاسم
+            pass
 
-        # 3) تسجيل معاملة الإنشاء
+        # (C) تسجيل معاملة الإنشاء
         conn.execute(
             text("""INSERT INTO transactions
                     (id, wallet_id, type, amount, created_at)
@@ -287,11 +278,8 @@ DASHBOARD_HTML = """<!doctype html><html lang="en" dir="ltr"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Nono Wallet Dashboard</title>
 <style>
-  :root{
-    --bg1:#6a11cb; --bg2:#2575fc;
-    --card:#ffffff; --line:#e6e8ef; --text:#0f172a; --muted:#667085;
-    --primary:#6a11cb; --primary2:#7b3efc; --ok:#16a34a; --warn:#f59e0b; --err:#ef4444;
-  }
+  :root{ --bg1:#6a11cb; --bg2:#2575fc; --card:#ffffff; --line:#e6e8ef; --text:#0f172a; --muted:#667085;
+         --primary:#6a11cb; --primary2:#7b3efc; --ok:#16a34a; --warn:#f59e0b; --err:#ef4444; }
   *{box-sizing:border-box}
   body{margin:0;background:linear-gradient(135deg,var(--bg1),var(--bg2)) fixed;min-height:100vh;
        font-family:system-ui,Segoe UI,Arial,sans-serif;color:#0f172a}
