@@ -26,6 +26,37 @@ def _build_engine():
     return create_engine(url, pool_pre_ping=True)
 
 engine = _build_engine()
+def ensure_schema():
+    with engine.begin() as conn:
+        # إنشاء أولي (ما يحدّث جدول موجود)
+        conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS wallets (
+            id TEXT PRIMARY KEY,
+            balance NUMERIC NOT NULL DEFAULT 0
+        )"""))
+        conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS transactions (
+            id TEXT PRIMARY KEY,
+            wallet_id TEXT NOT NULL,
+            type TEXT NOT NULL,
+            amount NUMERIC NOT NULL,
+            created_at TIMESTAMP NOT NULL,
+            FOREIGN KEY(wallet_id) REFERENCES wallets(id)
+        )"""))
+
+        # 🔧 ترقية السكيمة: إضافة العمود name إذا مفقود
+        try:
+            # Postgres/Neon
+            conn.execute(text("ALTER TABLE wallets ADD COLUMN IF NOT EXISTS name TEXT UNIQUE"))
+        except Exception:
+            # SQLite قديم ممكن ما يدعم IF NOT EXISTS
+            try:
+                res = conn.execute(text("PRAGMA table_info(wallets)")).mappings().all()
+                has_name = any(r.get("name") == "name" for r in res)
+                if not has_name:
+                    conn.execute(text("ALTER TABLE wallets ADD COLUMN name TEXT UNIQUE"))
+            except Exception as _:
+                print("SCHEMA ALTER WARNING:", _)
 
 def ensure_schema():
     with engine.begin() as conn:
