@@ -1,7 +1,7 @@
 import os
 import uuid
 from datetime import datetime
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, abort  # ← أضفنا abort
 from sqlalchemy import create_engine, text
 
 # ------------------------------------------------------------------------------
@@ -52,9 +52,10 @@ except Exception as e:
     print("SCHEMA INIT WARNING:", e)
 
 # ------------------------------------------------------------------------------
-# Security: API Token (X-Api-Key)
+# Security: API Token (X-Api-Key) + WHOAMI_TOKEN
 # ------------------------------------------------------------------------------
 API_TOKEN = (os.environ.get("API_TOKEN") or "").strip()
+WHOAMI_TOKEN = (os.environ.get("WHOAMI_TOKEN") or "").strip()  # ← أضفنا هذا
 
 def require_api_key(fn):
     from functools import wraps
@@ -67,11 +68,28 @@ def require_api_key(fn):
     return _wrap
 
 # ------------------------------------------------------------------------------
-# Health
+# Health & Basic
 # ------------------------------------------------------------------------------
 @app.get("/__ping")
 def __ping():
-    return jsonify({"ok": True, "routes_count": 16})
+    # نحسب عدد الراوتات ديناميكياً حتى يبقى صحيح حتى مع الإضافات
+    routes = [r.rule for r in app.url_map.iter_rules() if r.endpoint != 'static']
+    return jsonify({"ok": True, "routes_count": len(routes), "routes": routes})
+
+@app.get("/health")  # ← أضفنا هذا
+def health():
+    return jsonify({"ok": True, "name": "nono-wallet", "time": datetime.utcnow().isoformat() + "Z"})
+
+@app.get("/whoami")  # ← أضفنا هذا
+def whoami():
+    required = WHOAMI_TOKEN.strip()
+    sent = (request.headers.get("X-Auth-Token") or "").strip()
+    if not required:
+        # نخليها فاشلة بوضوح إذا ما مكوّن التوكن
+        return jsonify({"ok": False, "error": "WHOAMI_TOKEN not configured"}), 500
+    if sent != required:
+        abort(401)
+    return jsonify({"ok": True, "user": "nono-wallet", "env": os.getenv("RAILWAY_ENVIRONMENT_NAME", "local")})
 
 @app.get("/")
 def home():
