@@ -88,17 +88,6 @@ except Exception as e:
     # لا نطيح السيرفر؛ اللوج فقط
     print("SCHEMA INIT/UPGRADE WARNING:", e)
 
-# ---- one-time DDL (admin) ----
-@app.post("/__admin/ddl/add_name")
-def __add_name():
-    # حماية مزدوجة
-    if request.headers.get("X-Api-Key") != (os.environ.get("API_TOKEN") or "").strip() \
-       or request.headers.get("X-Auth-Token") != (os.environ.get("WHOAMI_TOKEN") or "").strip():
-        abort(401)
-    with engine.begin() as conn:
-        conn.execute(text("ALTER TABLE wallets ADD COLUMN IF NOT EXISTS name TEXT UNIQUE"))
-    return jsonify(ok=True, applied=True)
-
 # ------------------------------------------------------------------------------
 # Security: API Token (X-Api-Key) + WHOAMI_TOKEN
 # ------------------------------------------------------------------------------
@@ -157,7 +146,7 @@ def wallet_create():
             text("INSERT INTO wallets (id, balance) VALUES (:id, 0)"),
             {"id": wallet_id},
         )
-        # ملاحظة: نوع المعاملة يستخدم enum موجود (deposit/withdraw) لذا استعملنا deposit بقيمة 0
+        # مهم: نوع المعاملة يستخدم enum موجود (deposit/withdraw) لذا استعملنا deposit بقيمة 0
         conn.execute(
             text("""INSERT INTO transactions
                     (id, wallet_id, type, amount, created_at)
