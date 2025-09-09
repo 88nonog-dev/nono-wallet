@@ -1,0 +1,12 @@
+﻿# Local DB / cache
+*.sqlite3
+*.db
+__pycache__/
+*.pyc
+
+# Exports
+transactions_*.csv
+
+# Environment / secrets
+.env
+*.env
