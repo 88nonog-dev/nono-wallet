@@ -76,6 +76,15 @@ def ensure_schema():
                     conn.execute(text("ALTER TABLE wallets ADD COLUMN name TEXT UNIQUE"))
             except Exception as e:
                 print("SCHEMA ALTER WARNING:", e)
+# ---- one-time DDL (admin) ----
+@app.post("/__admin/ddl/add_name")
+def __add_name():
+    # حماية مزدوجة
+    if request.headers.get("X-Api-Key") != API_TOKEN or request.headers.get("X-Auth-Token") != WHOAMI_TOKEN:
+        abort(401)
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE wallets ADD COLUMN IF NOT EXISTS name TEXT UNIQUE"))
+    return jsonify(ok=True, applied=True)
 
 try:
     ensure_schema()
