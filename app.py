@@ -37,9 +37,10 @@ engine = _build_engine()
 def ensure_schema():
     """
     تضمن وجود الجداول الأساسية، وترقية الأعمدة المفقودة، وإنشاء فهارس محسّنة.
+    تعمل على Postgres وSQLite بأمان (idempotent).
     """
     with engine.begin() as conn:
-        # جداول أساسية
+        # --- جداول أساسية (CREATE IF NOT EXISTS لا يحدّث جداول قائمة) ---
         conn.execute(text("""
         CREATE TABLE IF NOT EXISTS wallets (
             id TEXT PRIMARY KEY,
@@ -56,7 +57,7 @@ def ensure_schema():
             FOREIGN KEY(wallet_id) REFERENCES wallets(id)
         )"""))
 
-        # wallets.name إذا مفقود
+        # --- ترقية: wallets.name إذا مفقود ---
         try:
             exists = conn.execute(text("""
                 SELECT 1 FROM information_schema.columns
@@ -67,6 +68,7 @@ def ensure_schema():
             if not exists:
                 conn.execute(text("ALTER TABLE wallets ADD COLUMN name TEXT UNIQUE"))
         except Exception:
+            # SQLite
             try:
                 res = conn.execute(text("PRAGMA table_info(wallets)")).mappings().all()
                 has_name = any(r.get("name") == "name" for r in res)
@@ -75,7 +77,7 @@ def ensure_schema():
             except Exception as e:
                 print("SCHEMA ALTER wallets.name WARNING:", e)
 
-        # transactions.idem_key (لـ Idempotency)
+        # --- ترقية: transactions.idem_key (Idempotency) ---
         try:
             exists = conn.execute(text("""
                 SELECT 1 FROM information_schema.columns
@@ -86,6 +88,7 @@ def ensure_schema():
             if not exists:
                 conn.execute(text("ALTER TABLE transactions ADD COLUMN idem_key TEXT"))
         except Exception:
+            # SQLite
             try:
                 res = conn.execute(text("PRAGMA table_info(transactions)")).mappings().all()
                 has_idem = any(r.get("name") == "idem_key" for r in res)
@@ -94,16 +97,18 @@ def ensure_schema():
             except Exception as e:
                 print("SCHEMA ALTER transactions.idem_key WARNING:", e)
 
-        # فهارس
+        # --- فهارس ---
         try:
             conn.execute(text("CREATE INDEX IF NOT EXISTS idx_wallets_name ON wallets (name)"))
         except Exception as e:
             print("INDEX wallets.name WARNING:", e)
+
         try:
             conn.execute(text("CREATE INDEX IF NOT EXISTS idx_tx_wallet_created ON transactions (wallet_id, created_at DESC)"))
         except Exception as e:
             print("INDEX transactions (wallet_id, created_at) WARNING:", e)
-        # فهرس/قيد فريد للـ idem_key (قد لا يدعمه SQLite؛ نتجاهل لو فشل)
+
+        # فهرس فريد على idem_key (جزئي في Postgres). قد لا يدعمه SQLite — تجاهل عند الفشل.
         try:
             conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_tx_idem ON transactions(idem_key) WHERE idem_key IS NOT NULL"))
         except Exception as e:
@@ -131,6 +136,41 @@ def require_api_key(fn):
     return _wrap
 
 # ------------------------------------------------------------------------------
+# Simple in-memory Rate Limiter (per API key/IP)
+# ------------------------------------------------------------------------------
+import time
+from collections import defaultdict, deque
+
+_rate_buckets = defaultdict(lambda: deque(maxlen=512))
+
+def _rate_key():
+    # نستخدم مفتاح الـ API أولاً، وإذا ما موجود ن fallback على الـ IP
+    return (request.headers.get("X-Api-Key") or request.remote_addr or "anon").strip()
+
+def rate_limited(limit=20, window=60):
+    """
+    يسمح بـ `limit` طلبات خلال `window` ثانية لكل مفتاح (API key/IP).
+    إذا تعدّى الحد يرجّع 429 مع retry_after.
+    """
+    def deco(fn):
+        from functools import wraps
+        @wraps(fn)
+        def wrap(*a, **kw):
+            now = time.time()
+            key = _rate_key()
+            q = _rate_buckets[key]
+            # حذف القديم خارج النافذة الزمنية
+            while q and (now - q[0]) > window:
+                q.popleft()
+            if len(q) >= limit:
+                retry = max(1, int(window - (now - q[0])))
+                return jsonify({"ok": False, "error": "rate_limited", "retry_after": retry}), 429
+            q.append(now)
+            return fn(*a, **kw)
+        return wrap
+    return deco
+
+# ------------------------------------------------------------------------------
 # Health & Basic
 # ------------------------------------------------------------------------------
 @app.get("/__ping")
@@ -155,6 +195,17 @@ def whoami():
 @app.get("/")
 def home():
     return jsonify({"ok": True, "name": "nono-wallet", "time": datetime.utcnow().isoformat() + "Z"})
+
+# ------------------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------------------
+def _get_idem_key(data: dict):
+    # الهيدر المفضّل Idempotency-Key (أو X-Idempotency-Key)، أو من جسم الطلب
+    k = (request.headers.get("Idempotency-Key")
+         or request.headers.get("X-Idempotency-Key")
+         or data.get("idempotency_key")
+         or "").strip()
+    return k or None
 
 # ------------------------------------------------------------------------------
 # Wallet APIs
@@ -194,16 +245,9 @@ def wallet_create():
 
     return jsonify({"ok": True, "wallet": {"id": wallet_id, "name": name, "balance": 0}})
 
-def _get_idem_key(data: dict):
-    # الهيدر المفضّل Idempotency-Key (أو X-Idempotency-Key)، أو من جسم الطلب
-    k = (request.headers.get("Idempotency-Key")
-         or request.headers.get("X-Idempotency-Key")
-         or data.get("idempotency_key")
-         or "").strip()
-    return k or None
-
 @app.post("/wallet/deposit")
 @require_api_key
+@rate_limited(limit=20, window=60)
 def wallet_deposit():
     data = request.get_json(silent=True) or {}
     wallet_id = data.get("wallet_id"); amount = float(data.get("amount") or 0)
@@ -220,19 +264,19 @@ def wallet_deposit():
                 return jsonify({"ok": True, "idempotent": True, "wallet": {"id": wallet_id, "balance": float(bal or 0)}})
 
         try:
-            # محاولة الإدراج أولاً لحماية من التكرار (قيد فريد على idem_key)
+            # إدراج المعاملة أولًا (حماية من التكرار عبر فهرس فريد على idem_key)
             txid = str(uuid.uuid4())
             conn.execute(text("""
                 INSERT INTO transactions (id, wallet_id, type, amount, created_at, idem_key)
                 VALUES (:id,:wid,'deposit',:amt,:ts,:ik)
             """), {"id": txid, "wid": wallet_id, "amt": amount, "ts": datetime.utcnow(), "ik": idem})
 
-            # ثم تحديث الرصيد
+            # تحديث الرصيد
             conn.execute(text("UPDATE wallets SET balance = balance + :amt WHERE id=:id"),
                          {"amt": amount, "id": wallet_id})
 
         except Exception:
-            # إذا كان السبب تكرار idem_key (سباق أو إعادة إرسال)، نعتبرها idempotent
+            # تكرار idem_key → اعتبرها idempotent
             if idem:
                 bal = conn.execute(text("SELECT balance FROM wallets WHERE id=:id"), {"id": wallet_id}).scalar()
                 return jsonify({"ok": True, "idempotent": True, "wallet": {"id": wallet_id, "balance": float(bal or 0)}})
@@ -242,6 +286,7 @@ def wallet_deposit():
 
 @app.post("/wallet/withdraw")
 @require_api_key
+@rate_limited(limit=15, window=60)
 def wallet_withdraw():
     data = request.get_json(silent=True) or {}
     wallet_id = data.get("wallet_id"); amount = float(data.get("amount") or 0)
@@ -263,7 +308,7 @@ def wallet_withdraw():
                 return jsonify({"ok": True, "idempotent": True, "wallet": {"id": wallet_id, "balance": float(bal2 or 0)}})
 
         try:
-            # إدراج المعاملة أولًا مع idem_key
+            # إدراج المعاملة أولًا
             txid = str(uuid.uuid4())
             conn.execute(text("""
                 INSERT INTO transactions (id, wallet_id, type, amount, created_at, idem_key)
@@ -294,7 +339,7 @@ def wallet_balance():
     return jsonify({"ok": True, "wallet": {"id": wallet_id, "balance": float(bal or 0)}})
 
 # ------------------------------------------------------------------------------
-# Transactions list + CSV (مع فلاتر)
+# Transactions list + CSV (مع فلاتر + Pagination)
 # ------------------------------------------------------------------------------
 @app.get("/transactions")
 @require_api_key
@@ -349,7 +394,7 @@ def transactions_export():
     return Response(gen(), mimetype="text/csv")
 
 # ------------------------------------------------------------------------------
-# Dashboard (Token hidden)
+# Dashboard (Token hidden + Idempotency من الواجهة)
 # ------------------------------------------------------------------------------
 @app.get("/dashboard")
 def dashboard():
@@ -543,7 +588,7 @@ async function depositWithdraw(kind, amount){
   if(!(amount>0)) return alert("Amount must be > 0");
   const url = (kind==="deposit")?"/wallet/deposit":"/wallet/withdraw";
   const headers = {...hdr(),"Content-Type":"application/json"};
-  // نضع Idempotency-Key حتى لو نقر المستخدم مرتين
+  // Idempotency من الواجهة
   headers["Idempotency-Key"] = "web-"+Date.now()+"-"+Math.random().toString(16).slice(2);
   const r = await fetch(url,{method:"POST",headers, body: JSON.stringify({wallet_id:id, amount:Number(amount)})});
   const j = await r.json();
