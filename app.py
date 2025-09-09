@@ -36,12 +36,10 @@ engine = _build_engine()
 
 def ensure_schema():
     """
-    تضمن وجود الجداول الأساسية، وتُرقّي جدول wallets لإضافة العمود name إذا كان مفقود.
-    CREATE TABLE IF NOT EXISTS لا يحدّث الجداول القائمة، لذلك نفحص information_schema (لـ Postgres)
-    أو PRAGMA (لـ SQLite). وننشئ فهارس محسّنة.
+    تضمن وجود الجداول الأساسية، وترقية الأعمدة المفقودة، وإنشاء فهارس محسّنة.
     """
     with engine.begin() as conn:
-        # إنشاء الجداول إن لم تكن موجودة (لا يحدّث الجداول القديمة)
+        # جداول أساسية
         conn.execute(text("""
         CREATE TABLE IF NOT EXISTS wallets (
             id TEXT PRIMARY KEY,
@@ -58,31 +56,45 @@ def ensure_schema():
             FOREIGN KEY(wallet_id) REFERENCES wallets(id)
         )"""))
 
-        # ترقية السكيمة: إضافة wallets.name إذا كان مفقود
+        # wallets.name إذا مفقود
         try:
-            # Postgres/Neon عبر information_schema
-            exists = conn.execute(
-                text("""
-                    SELECT 1
-                    FROM information_schema.columns
-                    WHERE table_schema = current_schema()
-                      AND table_name   = 'wallets'
-                      AND column_name  = 'name'
-                """)
-            ).scalar()
+            exists = conn.execute(text("""
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name   = 'wallets'
+                  AND column_name  = 'name'
+            """)).scalar()
             if not exists:
                 conn.execute(text("ALTER TABLE wallets ADD COLUMN name TEXT UNIQUE"))
         except Exception:
-            # Fallback لـ SQLite
             try:
                 res = conn.execute(text("PRAGMA table_info(wallets)")).mappings().all()
                 has_name = any(r.get("name") == "name" for r in res)
                 if not has_name:
                     conn.execute(text("ALTER TABLE wallets ADD COLUMN name TEXT UNIQUE"))
             except Exception as e:
-                print("SCHEMA ALTER WARNING:", e)
+                print("SCHEMA ALTER wallets.name WARNING:", e)
 
-        # فهارس لتحسين الأداء (آمنة للتشغيل المتكرر)
+        # transactions.idem_key (لـ Idempotency)
+        try:
+            exists = conn.execute(text("""
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name   = 'transactions'
+                  AND column_name  = 'idem_key'
+            """)).scalar()
+            if not exists:
+                conn.execute(text("ALTER TABLE transactions ADD COLUMN idem_key TEXT"))
+        except Exception:
+            try:
+                res = conn.execute(text("PRAGMA table_info(transactions)")).mappings().all()
+                has_idem = any(r.get("name") == "idem_key" for r in res)
+                if not has_idem:
+                    conn.execute(text("ALTER TABLE transactions ADD COLUMN idem_key TEXT"))
+            except Exception as e:
+                print("SCHEMA ALTER transactions.idem_key WARNING:", e)
+
+        # فهارس
         try:
             conn.execute(text("CREATE INDEX IF NOT EXISTS idx_wallets_name ON wallets (name)"))
         except Exception as e:
@@ -91,11 +103,15 @@ def ensure_schema():
             conn.execute(text("CREATE INDEX IF NOT EXISTS idx_tx_wallet_created ON transactions (wallet_id, created_at DESC)"))
         except Exception as e:
             print("INDEX transactions (wallet_id, created_at) WARNING:", e)
+        # فهرس/قيد فريد للـ idem_key (قد لا يدعمه SQLite؛ نتجاهل لو فشل)
+        try:
+            conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_tx_idem ON transactions(idem_key) WHERE idem_key IS NOT NULL"))
+        except Exception as e:
+            print("INDEX ux_tx_idem WARNING:", e)
 
 try:
     ensure_schema()
 except Exception as e:
-    # لا نطيح السيرفر؛ اللوج فقط
     print("SCHEMA INIT/UPGRADE WARNING:", e)
 
 # ------------------------------------------------------------------------------
@@ -148,59 +164,80 @@ def home():
 def wallet_create():
     """
     إنشاء محفظة بدون الاعتماد على وجود عمود name (Self-heal).
-    نستخدم معاملتين مستقلتين لتجنّب إبطال المعاملة على Postgres إذا فشل تحديث الاسم.
-    نسجّل معاملة 'deposit' بقيمة 0 بدل نوع 'create' لضمان التوافق مع أي قيود نوع.
+    نسجّل معاملة 'deposit' بقيمة 0 (للتتبع)، وتحديث الاسم بمحاولة منفصلة.
     """
     data = request.get_json(silent=True) or {}
     name = data.get("name") or f"wallet-{uuid.uuid4().hex[:6]}"
     wallet_id = str(uuid.uuid4())
 
-    # (1) معاملة أولى: إدراج المحفظة + تسجيل معاملة أولية (deposit=0)
+    # (1) إدراج المحفظة + معاملة أولية (deposit=0)
     with engine.begin() as conn:
-        conn.execute(
-            text("INSERT INTO wallets (id, balance) VALUES (:id, 0)"),
-            {"id": wallet_id},
-        )
-        conn.execute(
-            text("""INSERT INTO transactions
-                    (id, wallet_id, type, amount, created_at)
-                    VALUES (:id,:wid,:typ,:amt,:ts)"""),
-            {
-                "id": str(uuid.uuid4()),
-                "wid": wallet_id,
-                "typ": "deposit",   # متوافق دائمًا
-                "amt": 0,
-                "ts": datetime.utcnow(),
-            },
-        )
+        conn.execute(text("INSERT INTO wallets (id, balance) VALUES (:id, 0)"), {"id": wallet_id})
+        conn.execute(text("""
+            INSERT INTO transactions (id, wallet_id, type, amount, created_at)
+            VALUES (:id,:wid,:typ,:amt,:ts)
+        """), {
+            "id": str(uuid.uuid4()),
+            "wid": wallet_id,
+            "typ": "deposit",
+            "amt": 0,
+            "ts": datetime.utcnow(),
+        })
 
-    # (2) محاولة تحديث الاسم في معاملة مستقلة (إذا العمود موجود)
+    # (2) تحديث الاسم (لو العمود موجود)
     try:
         with engine.begin() as conn2:
-            conn2.execute(
-                text("UPDATE wallets SET name = :name WHERE id = :id"),
-                {"id": wallet_id, "name": name},
-            )
+            conn2.execute(text("UPDATE wallets SET name = :name WHERE id = :id"),
+                          {"id": wallet_id, "name": name})
     except Exception as e:
-        # إذا العمود غير موجود أو أي خطأ، نتجاهل لتبقى العملية ناجحة
         print("NAME UPDATE SKIPPED:", e)
 
     return jsonify({"ok": True, "wallet": {"id": wallet_id, "name": name, "balance": 0}})
+
+def _get_idem_key(data: dict):
+    # الهيدر المفضّل Idempotency-Key (أو X-Idempotency-Key)، أو من جسم الطلب
+    k = (request.headers.get("Idempotency-Key")
+         or request.headers.get("X-Idempotency-Key")
+         or data.get("idempotency_key")
+         or "").strip()
+    return k or None
 
 @app.post("/wallet/deposit")
 @require_api_key
 def wallet_deposit():
     data = request.get_json(silent=True) or {}
     wallet_id = data.get("wallet_id"); amount = float(data.get("amount") or 0)
+    idem = _get_idem_key(data)
     if not wallet_id or amount <= 0:
         return jsonify({"ok": False, "error": "wallet_id and positive amount required"}), 400
+
     with engine.begin() as conn:
-        conn.execute(text("UPDATE wallets SET balance = balance + :amt WHERE id=:id"),
-                     {"amt": amount, "id": wallet_id})
-        conn.execute(text("""INSERT INTO transactions
-            (id, wallet_id, type, amount, created_at)
-            VALUES (:id,:wid,:typ,:amt,:ts)"""),
-            {"id": str(uuid.uuid4()), "wid": wallet_id, "typ": "deposit", "amt": amount, "ts": datetime.utcnow()})
+        # لو سبق وانعملت بنفس idem key نرجّع النتيجة الحالية كـ idempotent
+        if idem:
+            row = conn.execute(text("SELECT id FROM transactions WHERE idem_key=:k"), {"k": idem}).first()
+            if row:
+                bal = conn.execute(text("SELECT balance FROM wallets WHERE id=:id"), {"id": wallet_id}).scalar()
+                return jsonify({"ok": True, "idempotent": True, "wallet": {"id": wallet_id, "balance": float(bal or 0)}})
+
+        try:
+            # محاولة الإدراج أولاً لحماية من التكرار (قيد فريد على idem_key)
+            txid = str(uuid.uuid4())
+            conn.execute(text("""
+                INSERT INTO transactions (id, wallet_id, type, amount, created_at, idem_key)
+                VALUES (:id,:wid,'deposit',:amt,:ts,:ik)
+            """), {"id": txid, "wid": wallet_id, "amt": amount, "ts": datetime.utcnow(), "ik": idem})
+
+            # ثم تحديث الرصيد
+            conn.execute(text("UPDATE wallets SET balance = balance + :amt WHERE id=:id"),
+                         {"amt": amount, "id": wallet_id})
+
+        except Exception:
+            # إذا كان السبب تكرار idem_key (سباق أو إعادة إرسال)، نعتبرها idempotent
+            if idem:
+                bal = conn.execute(text("SELECT balance FROM wallets WHERE id=:id"), {"id": wallet_id}).scalar()
+                return jsonify({"ok": True, "idempotent": True, "wallet": {"id": wallet_id, "balance": float(bal or 0)}})
+            raise
+
     return jsonify({"ok": True})
 
 @app.post("/wallet/withdraw")
@@ -208,18 +245,42 @@ def wallet_deposit():
 def wallet_withdraw():
     data = request.get_json(silent=True) or {}
     wallet_id = data.get("wallet_id"); amount = float(data.get("amount") or 0)
+    idem = _get_idem_key(data)
     if not wallet_id or amount <= 0:
         return jsonify({"ok": False, "error": "wallet_id and positive amount required"}), 400
+
     with engine.begin() as conn:
+        # التحقّق من الرصيد أولًا
         bal = conn.execute(text("SELECT balance FROM wallets WHERE id=:id"), {"id": wallet_id}).scalar()
         if bal is None or float(bal) < amount:
             return jsonify({"ok": False, "error": "insufficient funds"}), 400
-        conn.execute(text("UPDATE wallets SET balance = balance - :amt WHERE id=:id"),
-                     {"amt": amount, "id": wallet_id})
-        conn.execute(text("""INSERT INTO transactions
-            (id, wallet_id, type, amount, created_at)
-            VALUES (:id,:wid,:typ,:amt,:ts)"""),
-            {"id": str(uuid.uuid4()), "wid": wallet_id, "typ": "withdraw", "amt": amount, "ts": datetime.utcnow()})
+
+        # لو سبق وانعملت بنفس idem key نرجّع النتيجة الحالية كـ idempotent
+        if idem:
+            row = conn.execute(text("SELECT id FROM transactions WHERE idem_key=:k"), {"k": idem}).first()
+            if row:
+                bal2 = conn.execute(text("SELECT balance FROM wallets WHERE id=:id"), {"id": wallet_id}).scalar()
+                return jsonify({"ok": True, "idempotent": True, "wallet": {"id": wallet_id, "balance": float(bal2 or 0)}})
+
+        try:
+            # إدراج المعاملة أولًا مع idem_key
+            txid = str(uuid.uuid4())
+            conn.execute(text("""
+                INSERT INTO transactions (id, wallet_id, type, amount, created_at, idem_key)
+                VALUES (:id,:wid,'withdraw',:amt,:ts,:ik)
+            """), {"id": txid, "wid": wallet_id, "amt": amount, "ts": datetime.utcnow(), "ik": idem})
+
+            # ثم خصم الرصيد
+            conn.execute(text("UPDATE wallets SET balance = balance - :amt WHERE id=:id"),
+                         {"amt": amount, "id": wallet_id})
+
+        except Exception:
+            # تكرار idem_key → رجّع الرصيد الحالي بدون خصم جديد
+            if idem:
+                bal3 = conn.execute(text("SELECT balance FROM wallets WHERE id=:id"), {"id": wallet_id}).scalar()
+                return jsonify({"ok": True, "idempotent": True, "wallet": {"id": wallet_id, "balance": float(bal3 or 0)}})
+            raise
+
     return jsonify({"ok": True})
 
 @app.get("/wallet/balance")
@@ -241,8 +302,10 @@ def transactions_list():
     wallet_id = request.args.get("wallet_id")
     date_from = request.args.get("date_from")
     date_to   = request.args.get("date_to")
+    limit = max(1, min(int(request.args.get("limit", 200)), 500))
+    offset = max(0, int(request.args.get("offset", 0)))
 
-    where = ["1=1"]; args = {}
+    where = ["1=1"]; args = {"limit": limit, "offset": offset}
     if wallet_id:
         where.append("wallet_id = :wid"); args["wid"] = wallet_id
     if date_from:
@@ -254,10 +317,10 @@ def transactions_list():
               FROM transactions
               WHERE {' AND '.join(where)}
               ORDER BY created_at DESC
-              LIMIT 500"""
+              LIMIT :limit OFFSET :offset"""
     with engine.begin() as conn:
         rows = conn.execute(text(sql), args).mappings().all()
-    return jsonify({"ok": True, "items": [dict(r) for r in rows]})
+    return jsonify({"ok": True, "items": [dict(r) for r in rows], "limit": limit, "offset": offset})
 
 @app.get("/transactions/export.csv")
 @require_api_key
@@ -420,12 +483,12 @@ const btnCsv = $("#btnCsv");
 
 const LS_KEY="nono_api_key", LS_WAL="nono_last_wallet";
 
-// لا نظهر التوكن المحفوظ بالمجال، فقط نضع Placeholder
+// لا نظهر التوكن المحفوظ بالمجال، فقط Placeholder
 const savedKey = localStorage.getItem(LS_KEY)||"";
 if(savedKey){ apiKeyEl.placeholder = "Saved ✓"; }
 walletEl.value = localStorage.getItem(LS_WAL)||"";
 
-// الهيدر يقرأ من localStorage أولاً، وإذا فارغ يأخذ من الحقل (المخفي)
+// الهيدر يقرأ من localStorage أولاً
 function hdr(){
   const k = (localStorage.getItem(LS_KEY) || apiKeyEl.value || "").trim();
   return {"X-Api-Key": k};
@@ -479,8 +542,10 @@ async function depositWithdraw(kind, amount){
   if(!id) return alert("Wallet ID required");
   if(!(amount>0)) return alert("Amount must be > 0");
   const url = (kind==="deposit")?"/wallet/deposit":"/wallet/withdraw";
-  const r = await fetch(url,{method:"POST",headers:{...hdr(),"Content-Type":"application/json"},
-      body: JSON.stringify({wallet_id:id, amount:Number(amount)})});
+  const headers = {...hdr(),"Content-Type":"application/json"};
+  // نضع Idempotency-Key حتى لو نقر المستخدم مرتين
+  headers["Idempotency-Key"] = "web-"+Date.now()+"-"+Math.random().toString(16).slice(2);
+  const r = await fetch(url,{method:"POST",headers, body: JSON.stringify({wallet_id:id, amount:Number(amount)})});
   const j = await r.json();
   if(!j.ok) alert(j.error||"Error"); else { await fetchBalance(); await loadTx(); }
 }
