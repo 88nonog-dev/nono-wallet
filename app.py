@@ -3,7 +3,6 @@
 # Author: Mohammed Nasser Zimam (محمد ناصر زمام)
 # Company: شركة الصقر الملكي للمقاولات العامة
 # Year: 2025
-# Note: ملف تشغيل رئيسي (Flask) جاهز لـ Railway
 # ------------------------------------------------------------
 
 import os
@@ -63,7 +62,13 @@ def ensure_schema():
         try:
             # Postgres/Neon عبر information_schema
             exists = conn.execute(
-                text("SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name='wallets' AND column_name='name'")
+                text("""
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_schema = current_schema()
+                      AND table_name   = 'wallets'
+                      AND column_name  = 'name'
+                """)
             ).scalar()
             if not exists:
                 conn.execute(text("ALTER TABLE wallets ADD COLUMN name TEXT UNIQUE"))
@@ -76,21 +81,23 @@ def ensure_schema():
                     conn.execute(text("ALTER TABLE wallets ADD COLUMN name TEXT UNIQUE"))
             except Exception as e:
                 print("SCHEMA ALTER WARNING:", e)
-# ---- one-time DDL (admin) ----
-@app.post("/__admin/ddl/add_name")
-def __add_name():
-    # حماية مزدوجة
-    if request.headers.get("X-Api-Key") != API_TOKEN or request.headers.get("X-Auth-Token") != WHOAMI_TOKEN:
-        abort(401)
-    with engine.begin() as conn:
-        conn.execute(text("ALTER TABLE wallets ADD COLUMN IF NOT EXISTS name TEXT UNIQUE"))
-    return jsonify(ok=True, applied=True)
 
 try:
     ensure_schema()
 except Exception as e:
     # لا نطيح السيرفر؛ اللوج فقط
     print("SCHEMA INIT/UPGRADE WARNING:", e)
+
+# ---- one-time DDL (admin) ----
+@app.post("/__admin/ddl/add_name")
+def __add_name():
+    # حماية مزدوجة
+    if request.headers.get("X-Api-Key") != (os.environ.get("API_TOKEN") or "").strip() \
+       or request.headers.get("X-Auth-Token") != (os.environ.get("WHOAMI_TOKEN") or "").strip():
+        abort(401)
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE wallets ADD COLUMN IF NOT EXISTS name TEXT UNIQUE"))
+    return jsonify(ok=True, applied=True)
 
 # ------------------------------------------------------------------------------
 # Security: API Token (X-Api-Key) + WHOAMI_TOKEN
@@ -144,25 +151,13 @@ def wallet_create():
     name = data.get("name") or f"wallet-{uuid.uuid4().hex[:6]}"
     wallet_id = str(uuid.uuid4())
 
+    # (1) معاملة أولى: إدراج المحفظة بدون الاعتماد على 'name' + تسجيل معاملة أولية (deposit=0)
     with engine.begin() as conn:
-        # (A) إدراج آمن بدون الاعتماد على عمود name
         conn.execute(
             text("INSERT INTO wallets (id, balance) VALUES (:id, 0)"),
             {"id": wallet_id},
         )
-
-        # (B) محاولة ضبط الاسم إذا كان العمود موجود
-        try:
-            # Postgres: إذا العمود موجود يتحدث؛ لو مو موجود راح يرمي UndefinedColumn فنطنشه
-            conn.execute(
-                text("UPDATE wallets SET name = :name WHERE id = :id"),
-                {"id": wallet_id, "name": name},
-            )
-        except Exception:
-            # نتجاهل الخطأ — يبقى الجدول يشتغل بدون الاسم
-            pass
-
-        # (C) تسجيل معاملة الإنشاء
+        # ملاحظة: نوع المعاملة يستخدم enum موجود (deposit/withdraw) لذا استعملنا deposit بقيمة 0
         conn.execute(
             text("""INSERT INTO transactions
                     (id, wallet_id, type, amount, created_at)
@@ -170,11 +165,22 @@ def wallet_create():
             {
                 "id": str(uuid.uuid4()),
                 "wid": wallet_id,
-                "typ": "create",
+                "typ": "deposit",   # كان "create" وتسبب بخطأ enum
                 "amt": 0,
                 "ts": datetime.utcnow(),
             },
         )
+
+    # (2) محاولة تحديث الاسم في معاملة مستقلة (إذا العمود موجود)
+    try:
+        with engine.begin() as conn2:
+            conn2.execute(
+                text("UPDATE wallets SET name = :name WHERE id = :id"),
+                {"id": wallet_id, "name": name},
+            )
+    except Exception as e:
+        # إذا العمود غير موجود أو أي خطأ، نتجاهل لتبقى العملية ناجحة
+        print("NAME UPDATE SKIPPED:", e)
 
     return jsonify({"ok": True, "wallet": {"id": wallet_id, "name": name, "balance": 0}})
 
