@@ -38,7 +38,7 @@ def ensure_schema():
     """
     تضمن وجود الجداول الأساسية، وتُرقّي جدول wallets لإضافة العمود name إذا كان مفقود.
     CREATE TABLE IF NOT EXISTS لا يحدّث الجداول القائمة، لذلك نفحص information_schema (لـ Postgres)
-    أو PRAGMA (لـ SQLite).
+    أو PRAGMA (لـ SQLite). وننشئ فهارس محسّنة.
     """
     with engine.begin() as conn:
         # إنشاء الجداول إن لم تكن موجودة (لا يحدّث الجداول القديمة)
@@ -81,6 +81,16 @@ def ensure_schema():
                     conn.execute(text("ALTER TABLE wallets ADD COLUMN name TEXT UNIQUE"))
             except Exception as e:
                 print("SCHEMA ALTER WARNING:", e)
+
+        # فهارس لتحسين الأداء (آمنة للتشغيل المتكرر)
+        try:
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_wallets_name ON wallets (name)"))
+        except Exception as e:
+            print("INDEX wallets.name WARNING:", e)
+        try:
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_tx_wallet_created ON transactions (wallet_id, created_at DESC)"))
+        except Exception as e:
+            print("INDEX transactions (wallet_id, created_at) WARNING:", e)
 
 try:
     ensure_schema()
@@ -136,17 +146,21 @@ def home():
 @app.post("/wallet/create")
 @require_api_key
 def wallet_create():
+    """
+    إنشاء محفظة بدون الاعتماد على وجود عمود name (Self-heal).
+    نستخدم معاملتين مستقلتين لتجنّب إبطال المعاملة على Postgres إذا فشل تحديث الاسم.
+    نسجّل معاملة 'deposit' بقيمة 0 بدل نوع 'create' لضمان التوافق مع أي قيود نوع.
+    """
     data = request.get_json(silent=True) or {}
     name = data.get("name") or f"wallet-{uuid.uuid4().hex[:6]}"
     wallet_id = str(uuid.uuid4())
 
-    # (1) معاملة أولى: إدراج المحفظة بدون الاعتماد على 'name' + تسجيل معاملة أولية (deposit=0)
+    # (1) معاملة أولى: إدراج المحفظة + تسجيل معاملة أولية (deposit=0)
     with engine.begin() as conn:
         conn.execute(
             text("INSERT INTO wallets (id, balance) VALUES (:id, 0)"),
             {"id": wallet_id},
         )
-        # مهم: نوع المعاملة يستخدم enum موجود (deposit/withdraw) لذا استعملنا deposit بقيمة 0
         conn.execute(
             text("""INSERT INTO transactions
                     (id, wallet_id, type, amount, created_at)
@@ -154,7 +168,7 @@ def wallet_create():
             {
                 "id": str(uuid.uuid4()),
                 "wid": wallet_id,
-                "typ": "deposit",   # كان "create" وتسبب بخطأ enum
+                "typ": "deposit",   # متوافق دائمًا
                 "amt": 0,
                 "ts": datetime.utcnow(),
             },
@@ -272,7 +286,7 @@ def transactions_export():
     return Response(gen(), mimetype="text/csv")
 
 # ------------------------------------------------------------------------------
-# Dashboard (Purple Wide UI)
+# Dashboard (Token hidden)
 # ------------------------------------------------------------------------------
 @app.get("/dashboard")
 def dashboard():
@@ -348,7 +362,7 @@ DASHBOARD_HTML = """<!doctype html><html lang="en" dir="ltr"><head>
     <!-- FILTERS -->
     <section class="card panel">
       <div class="row">
-        <input id="apiKey" placeholder="API Token" />
+        <input id="apiKey" placeholder="API Token" type="password" autocomplete="off" />
         <input id="walletId" placeholder="Wallet ID (uuid)" />
         <input id="dateFrom" type="date" />
         <input id="dateTo" type="date" />
@@ -405,10 +419,18 @@ const curBal = $("#curBal");
 const btnCsv = $("#btnCsv");
 
 const LS_KEY="nono_api_key", LS_WAL="nono_last_wallet";
-apiKeyEl.value = localStorage.getItem(LS_KEY)||"";
+
+// لا نظهر التوكن المحفوظ بالمجال، فقط نضع Placeholder
+const savedKey = localStorage.getItem(LS_KEY)||"";
+if(savedKey){ apiKeyEl.placeholder = "Saved ✓"; }
 walletEl.value = localStorage.getItem(LS_WAL)||"";
 
-function hdr(){ return {"X-Api-Key": apiKeyEl.value.trim() }; }
+// الهيدر يقرأ من localStorage أولاً، وإذا فارغ يأخذ من الحقل (المخفي)
+function hdr(){
+  const k = (localStorage.getItem(LS_KEY) || apiKeyEl.value || "").trim();
+  return {"X-Api-Key": k};
+}
+
 function fmtMoney(n){ return new Intl.NumberFormat("en-US",{style:"currency",currency:"USD",maximumFractionDigits:8}).format(Number(n)||0); }
 function setDonut(pct){
   const deg = Math.max(0,Math.min(100,pct))*3.6;
@@ -417,13 +439,26 @@ function setDonut(pct){
 }
 
 $("#btnSaveKey").onclick = ()=>{
-  localStorage.setItem(LS_KEY, apiKeyEl.value.trim());
+  const k = apiKeyEl.value.trim();
+  if(k) localStorage.setItem(LS_KEY, k);
   localStorage.setItem(LS_WAL, walletEl.value.trim());
+  apiKeyEl.value = "";
+  apiKeyEl.placeholder = "Saved ✓";
   alert("Saved");
 };
 
 $("#btnNewTx").onclick = ()=>$("#newTx").style.display="block";
 $("#txCancel").onclick = ()=>$("#newTx").style.display="none";
+
+// لو كتب المستخدم توكن جديد، نخزّنه ونُفرّغ الحقل مباشرة
+apiKeyEl.addEventListener("change", ()=>{
+  const k = apiKeyEl.value.trim();
+  if(k){
+    localStorage.setItem(LS_KEY, k);
+    apiKeyEl.value = "";
+    apiKeyEl.placeholder = "Saved ✓";
+  }
+});
 
 async function fetchBalance(){
   const id = walletEl.value.trim();
@@ -512,7 +547,6 @@ async function loadTx(){
   }catch(e){}
 }
 
-apiKeyEl.addEventListener("change", ()=>localStorage.setItem(LS_KEY, apiKeyEl.value.trim()));
 walletEl.addEventListener("change", ()=>{ localStorage.setItem(LS_WAL, walletEl.value.trim()); fetchBalance(); loadTx(); });
 searchEl.addEventListener("input", ()=>loadTx());
 fromEl.addEventListener("change", ()=>loadTx());
