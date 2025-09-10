@@ -7,7 +7,12 @@
 
 import os
 import uuid
-from datetime import datetime
+import io
+import csv
+import time
+from datetime import datetime, timedelta
+from functools import wraps
+
 from flask import Flask, request, jsonify, Response, abort
 from sqlalchemy import create_engine, text
 
@@ -15,7 +20,7 @@ from sqlalchemy import create_engine, text
 # Flask app
 # ------------------------------------------------------------------------------
 app = Flask(__name__)
-application = app  # alias إذا استعملت wsgi:application
+application = app  # alias لو احتجنا wsgi:application
 
 # ------------------------------------------------------------------------------
 # Database (Neon Postgres مع fallback SQLite) + إنشاء/ترقية سكيمة
@@ -36,11 +41,11 @@ engine = _build_engine()
 
 def ensure_schema():
     """
-    تضمن وجود الجداول الأساسية، وترقية الأعمدة المفقودة، وإنشاء فهارس محسّنة.
-    تعمل على Postgres وSQLite بأمان (idempotent).
+    تضمن وجود الجداول الأساسية، وترقية جدول wallets لإضافة العمود name إذا كان مفقود،
+    وترقية جدول transactions لإضافة عمود idempotency key + إنشاء الفهارس المفيدة.
     """
     with engine.begin() as conn:
-        # --- جداول أساسية (CREATE IF NOT EXISTS لا يحدّث جداول قائمة) ---
+        # جداول أساسية
         conn.execute(text("""
         CREATE TABLE IF NOT EXISTS wallets (
             id TEXT PRIMARY KEY,
@@ -51,68 +56,61 @@ def ensure_schema():
         CREATE TABLE IF NOT EXISTS transactions (
             id TEXT PRIMARY KEY,
             wallet_id TEXT NOT NULL,
-            type TEXT NOT NULL,
+            type TEXT NOT NULL,            -- deposit | withdraw
             amount NUMERIC NOT NULL,
             created_at TIMESTAMP NOT NULL,
             FOREIGN KEY(wallet_id) REFERENCES wallets(id)
         )"""))
 
-        # --- ترقية: wallets.name إذا مفقود ---
+        # --- ترقية: wallets.name ---
         try:
             exists = conn.execute(text("""
                 SELECT 1 FROM information_schema.columns
-                WHERE table_schema = current_schema()
-                  AND table_name   = 'wallets'
-                  AND column_name  = 'name'
+                WHERE table_name='wallets' AND column_name='name'
             """)).scalar()
             if not exists:
                 conn.execute(text("ALTER TABLE wallets ADD COLUMN name TEXT UNIQUE"))
         except Exception:
-            # SQLite
+            # SQLite fallback
             try:
-                res = conn.execute(text("PRAGMA table_info(wallets)")).mappings().all()
-                has_name = any(r.get("name") == "name" for r in res)
+                rows = conn.execute(text("PRAGMA table_info(wallets)")).mappings().all()
+                has_name = any(r.get("name") == "name" for r in rows)
                 if not has_name:
                     conn.execute(text("ALTER TABLE wallets ADD COLUMN name TEXT UNIQUE"))
             except Exception as e:
-                print("SCHEMA ALTER wallets.name WARNING:", e)
+                print("SCHEMA wallets.name WARNING:", e)
 
-        # --- ترقية: transactions.idem_key (Idempotency) ---
+        # --- ترقية: transactions.idem_key (idempotency) ---
         try:
             exists = conn.execute(text("""
                 SELECT 1 FROM information_schema.columns
-                WHERE table_schema = current_schema()
-                  AND table_name   = 'transactions'
-                  AND column_name  = 'idem_key'
+                WHERE table_name='transactions' AND column_name='idem_key'
             """)).scalar()
             if not exists:
                 conn.execute(text("ALTER TABLE transactions ADD COLUMN idem_key TEXT"))
+                # unique index
+                conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_tx_idem ON transactions(idem_key)"))
         except Exception:
-            # SQLite
+            # SQLite fallback
             try:
-                res = conn.execute(text("PRAGMA table_info(transactions)")).mappings().all()
-                has_idem = any(r.get("name") == "idem_key" for r in res)
-                if not has_idem:
+                rows = conn.execute(text("PRAGMA table_info(transactions)")).mappings().all()
+                has_col = any(r.get("name") == "idem_key" for r in rows)
+                if not has_col:
                     conn.execute(text("ALTER TABLE transactions ADD COLUMN idem_key TEXT"))
+                # create unique index (SQLite يسمح IF NOT EXISTS)
+                conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_tx_idem ON transactions(idem_key)"))
             except Exception as e:
-                print("SCHEMA ALTER transactions.idem_key WARNING:", e)
+                print("SCHEMA transactions.idem_key WARNING:", e)
 
-        # --- فهارس ---
+        # --- فهارس مفيدة ---
         try:
-            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_wallets_name ON wallets (name)"))
-        except Exception as e:
-            print("INDEX wallets.name WARNING:", e)
-
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_wallets_name ON wallets(name)"))
+        except Exception:
+            pass
         try:
-            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_tx_wallet_created ON transactions (wallet_id, created_at DESC)"))
-        except Exception as e:
-            print("INDEX transactions (wallet_id, created_at) WARNING:", e)
-
-        # فهرس فريد على idem_key (جزئي في Postgres). قد لا يدعمه SQLite — تجاهل عند الفشل.
-        try:
-            conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_tx_idem ON transactions(idem_key) WHERE idem_key IS NOT NULL"))
-        except Exception as e:
-            print("INDEX ux_tx_idem WARNING:", e)
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_tx_wallet_created ON transactions(wallet_id, created_at DESC)"))
+        except Exception:
+            pass
 
 try:
     ensure_schema()
@@ -126,7 +124,6 @@ API_TOKEN = (os.environ.get("API_TOKEN") or "").strip()
 WHOAMI_TOKEN = (os.environ.get("WHOAMI_TOKEN") or "").strip()
 
 def require_api_key(fn):
-    from functools import wraps
     @wraps(fn)
     def _wrap(*a, **kw):
         token = request.headers.get("X-Api-Key", "")
@@ -136,39 +133,37 @@ def require_api_key(fn):
     return _wrap
 
 # ------------------------------------------------------------------------------
-# Simple in-memory Rate Limiter (per API key/IP)
+# Rate limit بسيط داخل الذاكرة (يفضَّل WEB_CONCURRENCY=1 لإظهاره بوضوح)
 # ------------------------------------------------------------------------------
-import time
-from collections import defaultdict, deque
-
-_rate_buckets = defaultdict(lambda: deque(maxlen=512))
-
-def _rate_key():
-    # نستخدم مفتاح الـ API أولاً، وإذا ما موجود ن fallback على الـ IP
-    return (request.headers.get("X-Api-Key") or request.remote_addr or "anon").strip()
-
-def rate_limited(limit=20, window=60):
-    """
-    يسمح بـ `limit` طلبات خلال `window` ثانية لكل مفتاح (API key/IP).
-    إذا تعدّى الحد يرجّع 429 مع retry_after.
-    """
+_rate_state = {}  # key -> {count, reset_at}
+def rate_limit(limit:int, window_sec:int=60, key_func=None):
     def deco(fn):
-        from functools import wraps
         @wraps(fn)
-        def wrap(*a, **kw):
+        def _wrap(*a, **kw):
+            k = "global"
+            if key_func:
+                try:
+                    k = key_func()
+                except Exception:
+                    k = "global"
             now = time.time()
-            key = _rate_key()
-            q = _rate_buckets[key]
-            # حذف القديم خارج النافذة الزمنية
-            while q and (now - q[0]) > window:
-                q.popleft()
-            if len(q) >= limit:
-                retry = max(1, int(window - (now - q[0])))
-                return jsonify({"ok": False, "error": "rate_limited", "retry_after": retry}), 429
-            q.append(now)
+            st = _rate_state.get(k)
+            if not st or now >= st["reset_at"]:
+                st = {"count": 0, "reset_at": now + window_sec}
+                _rate_state[k] = st
+            if st["count"] >= limit:
+                return jsonify({"ok": False, "error": "Too Many Requests"}), 429
+            st["count"] += 1
             return fn(*a, **kw)
-        return wrap
+        return _wrap
     return deco
+
+def _rate_key(prefix:str):
+    def _k():
+        ip = request.headers.get("X-Forwarded-For", request.remote_addr or "0")
+        tk = request.headers.get("X-Api-Key", "")
+        return f"{prefix}|{ip}|{tk}"
+    return _k
 
 # ------------------------------------------------------------------------------
 # Health & Basic
@@ -197,45 +192,28 @@ def home():
     return jsonify({"ok": True, "name": "nono-wallet", "time": datetime.utcnow().isoformat() + "Z"})
 
 # ------------------------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------------------------
-def _get_idem_key(data: dict):
-    # الهيدر المفضّل Idempotency-Key (أو X-Idempotency-Key)، أو من جسم الطلب
-    k = (request.headers.get("Idempotency-Key")
-         or request.headers.get("X-Idempotency-Key")
-         or data.get("idempotency_key")
-         or "").strip()
-    return k or None
-
-# ------------------------------------------------------------------------------
 # Wallet APIs
 # ------------------------------------------------------------------------------
+
 @app.post("/wallet/create")
 @require_api_key
 def wallet_create():
-    """
-    إنشاء محفظة بدون الاعتماد على وجود عمود name (Self-heal).
-    نسجّل معاملة 'deposit' بقيمة 0 (للتتبع)، وتحديث الاسم بمحاولة منفصلة.
-    """
     data = request.get_json(silent=True) or {}
     name = data.get("name") or f"wallet-{uuid.uuid4().hex[:6]}"
     wallet_id = str(uuid.uuid4())
 
-    # (1) إدراج المحفظة + معاملة أولية (deposit=0)
+    # إنشاء محفظة بدون الاعتماد على عمود name (للتوافق الخلفي)
     with engine.begin() as conn:
-        conn.execute(text("INSERT INTO wallets (id, balance) VALUES (:id, 0)"), {"id": wallet_id})
-        conn.execute(text("""
-            INSERT INTO transactions (id, wallet_id, type, amount, created_at)
-            VALUES (:id,:wid,:typ,:amt,:ts)
-        """), {
-            "id": str(uuid.uuid4()),
-            "wid": wallet_id,
-            "typ": "deposit",
-            "amt": 0,
-            "ts": datetime.utcnow(),
-        })
+        conn.execute(text("INSERT INTO wallets (id, balance) VALUES (:id, 0)"),
+                     {"id": wallet_id})
+        # تسجيل معاملة أولية deposit=0 (بدل create)
+        conn.execute(text("""INSERT INTO transactions
+                (id, wallet_id, type, amount, created_at)
+                VALUES (:id,:wid,:typ,:amt,:ts)"""),
+                {"id": str(uuid.uuid4()), "wid": wallet_id, "typ": "deposit",
+                 "amt": 0, "ts": datetime.utcnow()})
 
-    # (2) تحديث الاسم (لو العمود موجود)
+    # محاولة تعيين الاسم إن كان العمود موجود
     try:
         with engine.begin() as conn2:
             conn2.execute(text("UPDATE wallets SET name = :name WHERE id = :id"),
@@ -245,88 +223,84 @@ def wallet_create():
 
     return jsonify({"ok": True, "wallet": {"id": wallet_id, "name": name, "balance": 0}})
 
+def _idempotent_exists(idem_key:str):
+    if not idem_key:
+        return None
+    with engine.begin() as conn:
+        row = conn.execute(text("""
+            SELECT id, wallet_id, type, amount, created_at
+            FROM transactions WHERE idem_key=:k
+        """), {"k": idem_key}).mappings().first()
+        return dict(row) if row else None
+
 @app.post("/wallet/deposit")
 @require_api_key
-@rate_limited(limit=20, window=60)
+@rate_limit(limit=20, window_sec=60, key_func=_rate_key("deposit"))
 def wallet_deposit():
     data = request.get_json(silent=True) or {}
-    wallet_id = data.get("wallet_id"); amount = float(data.get("amount") or 0)
-    idem = _get_idem_key(data)
+    wallet_id = data.get("wallet_id")
+    amount = float(data.get("amount") or 0)
+    idem = request.headers.get("Idempotency-Key", "").strip()
+    if idem:
+        ex = _idempotent_exists(idem)
+        if ex:
+            # إعادة نفس الاستجابة ولكن لا نعيد تطبيق العملية
+            with engine.begin() as conn:
+                bal = conn.execute(text("SELECT balance FROM wallets WHERE id=:id"),
+                                   {"id": ex["wallet_id"]}).scalar()
+            return jsonify({"ok": True, "idempotent": True,
+                            "tx": ex, "wallet": {"id": ex["wallet_id"],
+                                                 "balance": float(bal or 0)}})
     if not wallet_id or amount <= 0:
         return jsonify({"ok": False, "error": "wallet_id and positive amount required"}), 400
 
     with engine.begin() as conn:
-        # لو سبق وانعملت بنفس idem key نرجّع النتيجة الحالية كـ idempotent
-        if idem:
-            row = conn.execute(text("SELECT id FROM transactions WHERE idem_key=:k"), {"k": idem}).first()
-            if row:
-                bal = conn.execute(text("SELECT balance FROM wallets WHERE id=:id"), {"id": wallet_id}).scalar()
-                return jsonify({"ok": True, "idempotent": True, "wallet": {"id": wallet_id, "balance": float(bal or 0)}})
-
-        try:
-            # إدراج المعاملة أولًا (حماية من التكرار عبر فهرس فريد على idem_key)
-            txid = str(uuid.uuid4())
-            conn.execute(text("""
-                INSERT INTO transactions (id, wallet_id, type, amount, created_at, idem_key)
-                VALUES (:id,:wid,'deposit',:amt,:ts,:ik)
-            """), {"id": txid, "wid": wallet_id, "amt": amount, "ts": datetime.utcnow(), "ik": idem})
-
-            # تحديث الرصيد
-            conn.execute(text("UPDATE wallets SET balance = balance + :amt WHERE id=:id"),
-                         {"amt": amount, "id": wallet_id})
-
-        except Exception:
-            # تكرار idem_key → اعتبرها idempotent
-            if idem:
-                bal = conn.execute(text("SELECT balance FROM wallets WHERE id=:id"), {"id": wallet_id}).scalar()
-                return jsonify({"ok": True, "idempotent": True, "wallet": {"id": wallet_id, "balance": float(bal or 0)}})
-            raise
-
-    return jsonify({"ok": True})
+        conn.execute(text("UPDATE wallets SET balance = balance + :amt WHERE id=:id"),
+                     {"amt": amount, "id": wallet_id})
+        conn.execute(text("""INSERT INTO transactions
+            (id, wallet_id, type, amount, created_at, idem_key)
+            VALUES (:id,:wid,:typ,:amt,:ts,:idem)"""),
+            {"id": str(uuid.uuid4()), "wid": wallet_id, "typ": "deposit",
+             "amt": amount, "ts": datetime.utcnow(), "idem": idem or None})
+        bal = conn.execute(text("SELECT balance FROM wallets WHERE id=:id"),
+                           {"id": wallet_id}).scalar()
+    return jsonify({"ok": True, "wallet": {"id": wallet_id, "balance": float(bal or 0)}})
 
 @app.post("/wallet/withdraw")
 @require_api_key
-@rate_limited(limit=15, window=60)
+@rate_limit(limit=15, window_sec=60, key_func=_rate_key("withdraw"))
 def wallet_withdraw():
     data = request.get_json(silent=True) or {}
-    wallet_id = data.get("wallet_id"); amount = float(data.get("amount") or 0)
-    idem = _get_idem_key(data)
+    wallet_id = data.get("wallet_id")
+    amount = float(data.get("amount") or 0)
+    idem = request.headers.get("Idempotency-Key", "").strip()
+    if idem:
+        ex = _idempotent_exists(idem)
+        if ex:
+            with engine.begin() as conn:
+                bal = conn.execute(text("SELECT balance FROM wallets WHERE id=:id"),
+                                   {"id": ex["wallet_id"]}).scalar()
+            return jsonify({"ok": True, "idempotent": True,
+                            "tx": ex, "wallet": {"id": ex["wallet_id"],
+                                                 "balance": float(bal or 0)}})
     if not wallet_id or amount <= 0:
         return jsonify({"ok": False, "error": "wallet_id and positive amount required"}), 400
 
     with engine.begin() as conn:
-        # التحقّق من الرصيد أولًا
-        bal = conn.execute(text("SELECT balance FROM wallets WHERE id=:id"), {"id": wallet_id}).scalar()
+        bal = conn.execute(text("SELECT balance FROM wallets WHERE id=:id"),
+                           {"id": wallet_id}).scalar()
         if bal is None or float(bal) < amount:
             return jsonify({"ok": False, "error": "insufficient funds"}), 400
-
-        # لو سبق وانعملت بنفس idem key نرجّع النتيجة الحالية كـ idempotent
-        if idem:
-            row = conn.execute(text("SELECT id FROM transactions WHERE idem_key=:k"), {"k": idem}).first()
-            if row:
-                bal2 = conn.execute(text("SELECT balance FROM wallets WHERE id=:id"), {"id": wallet_id}).scalar()
-                return jsonify({"ok": True, "idempotent": True, "wallet": {"id": wallet_id, "balance": float(bal2 or 0)}})
-
-        try:
-            # إدراج المعاملة أولًا
-            txid = str(uuid.uuid4())
-            conn.execute(text("""
-                INSERT INTO transactions (id, wallet_id, type, amount, created_at, idem_key)
-                VALUES (:id,:wid,'withdraw',:amt,:ts,:ik)
-            """), {"id": txid, "wid": wallet_id, "amt": amount, "ts": datetime.utcnow(), "ik": idem})
-
-            # ثم خصم الرصيد
-            conn.execute(text("UPDATE wallets SET balance = balance - :amt WHERE id=:id"),
-                         {"amt": amount, "id": wallet_id})
-
-        except Exception:
-            # تكرار idem_key → رجّع الرصيد الحالي بدون خصم جديد
-            if idem:
-                bal3 = conn.execute(text("SELECT balance FROM wallets WHERE id=:id"), {"id": wallet_id}).scalar()
-                return jsonify({"ok": True, "idempotent": True, "wallet": {"id": wallet_id, "balance": float(bal3 or 0)}})
-            raise
-
-    return jsonify({"ok": True})
+        conn.execute(text("UPDATE wallets SET balance = balance - :amt WHERE id=:id"),
+                     {"amt": amount, "id": wallet_id})
+        conn.execute(text("""INSERT INTO transactions
+            (id, wallet_id, type, amount, created_at, idem_key)
+            VALUES (:id,:wid,:typ,:amt,:ts,:idem)"""),
+            {"id": str(uuid.uuid4()), "wid": wallet_id, "typ": "withdraw",
+             "amt": amount, "ts": datetime.utcnow(), "idem": idem or None})
+        bal2 = conn.execute(text("SELECT balance FROM wallets WHERE id=:id"),
+                            {"id": wallet_id}).scalar()
+    return jsonify({"ok": True, "wallet": {"id": wallet_id, "balance": float(bal2 or 0)}})
 
 @app.get("/wallet/balance")
 @require_api_key
@@ -335,41 +309,16 @@ def wallet_balance():
     if not wallet_id:
         return jsonify({"ok": False, "error": "wallet_id required"}), 400
     with engine.begin() as conn:
-        bal = conn.execute(text("SELECT balance FROM wallets WHERE id=:id"), {"id": wallet_id}).scalar()
+        bal = conn.execute(text("SELECT balance FROM wallets WHERE id=:id"),
+                           {"id": wallet_id}).scalar()
     return jsonify({"ok": True, "wallet": {"id": wallet_id, "balance": float(bal or 0)}})
 
 # ------------------------------------------------------------------------------
-# Transactions list + CSV (مع فلاتر + Pagination)
+# Transactions list + CSV (مع فلاتر)
 # ------------------------------------------------------------------------------
 @app.get("/transactions")
 @require_api_key
 def transactions_list():
-    wallet_id = request.args.get("wallet_id")
-    date_from = request.args.get("date_from")
-    date_to   = request.args.get("date_to")
-    limit = max(1, min(int(request.args.get("limit", 200)), 500))
-    offset = max(0, int(request.args.get("offset", 0)))
-
-    where = ["1=1"]; args = {"limit": limit, "offset": offset}
-    if wallet_id:
-        where.append("wallet_id = :wid"); args["wid"] = wallet_id
-    if date_from:
-        where.append("created_at >= :df"); args["df"] = date_from
-    if date_to:
-        where.append("created_at <= :dt"); args["dt"] = date_to
-
-    sql = f"""SELECT id, wallet_id, type, amount, created_at
-              FROM transactions
-              WHERE {' AND '.join(where)}
-              ORDER BY created_at DESC
-              LIMIT :limit OFFSET :offset"""
-    with engine.begin() as conn:
-        rows = conn.execute(text(sql), args).mappings().all()
-    return jsonify({"ok": True, "items": [dict(r) for r in rows], "limit": limit, "offset": offset})
-
-@app.get("/transactions/export.csv")
-@require_api_key
-def transactions_export():
     wallet_id = request.args.get("wallet_id")
     date_from = request.args.get("date_from")
     date_to   = request.args.get("date_to")
@@ -385,16 +334,63 @@ def transactions_export():
     sql = f"""SELECT id, wallet_id, type, amount, created_at
               FROM transactions
               WHERE {' AND '.join(where)}
+              ORDER BY created_at DESC
+              LIMIT 500"""
+    with engine.begin() as conn:
+        rows = conn.execute(text(sql), args).mappings().all()
+    return jsonify({"ok": True, "items": [dict(r) for r in rows]})
+
+@app.get("/transactions/export.csv")
+@require_api_key
+def transactions_export():
+    wallet_id = request.args.get("wallet_id")
+    date_from = request.args.get("date_from")
+    date_to   = request.args.get("date_to")
+
+    # دعم فاصل الأعمدة واسم الملف
+    sep = request.args.get("sep", ",")
+    if sep not in {",", ";", "|", "\t"}:
+        sep = ","
+    filename = request.args.get("filename", "transactions.csv")
+
+    where = ["1=1"]; args = {}
+    if wallet_id:
+        where.append("wallet_id = :wid"); args["wid"] = wallet_id
+    if date_from:
+        where.append("created_at >= :df"); args["df"] = date_from
+    if date_to:
+        where.append("created_at <= :dt"); args["dt"] = date_to
+
+    sql = f"""SELECT id, wallet_id, type, amount, created_at
+              FROM transactions
+              WHERE {' AND '.join(where)}
               ORDER BY created_at DESC"""
-    def gen():
-        yield "id,wallet_id,type,amount,created_at\n"
+
+    def generate():
+        sio = io.StringIO()
+        writer = csv.writer(sio, delimiter=sep, lineterminator="\n", quoting=csv.QUOTE_MINIMAL)
+
+        # العناوين
+        writer.writerow(["id", "wallet_id", "type", "amount", "created_at"])
+        yield sio.getvalue(); sio.seek(0); sio.truncate(0)
+
         with engine.begin() as conn:
             for r in conn.execute(text(sql), args):
-                yield f"{r.id},{r.wallet_id},{r.type},{r.amount},{r.created_at}\n"
-    return Response(gen(), mimetype="text/csv")
+                writer.writerow([
+                    r.id,
+                    r.wallet_id,
+                    r.type,
+                    str(r.amount),
+                    getattr(r.created_at, "isoformat", lambda: str(r.created_at))()
+                ])
+                yield sio.getvalue(); sio.seek(0); sio.truncate(0)
+
+    resp = Response(generate(), mimetype="text/csv; charset=utf-8")
+    resp.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+    return resp
 
 # ------------------------------------------------------------------------------
-# Dashboard (Token hidden + Idempotency من الواجهة)
+# Dashboard (Purple Wide UI) — token مخفي
 # ------------------------------------------------------------------------------
 @app.get("/dashboard")
 def dashboard():
@@ -404,11 +400,14 @@ DASHBOARD_HTML = """<!doctype html><html lang="en" dir="ltr"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Nono Wallet Dashboard</title>
 <style>
-  :root{ --bg1:#6a11cb; --bg2:#2575fc; --card:#ffffff; --line:#e6e8ef; --text:#0f172a; --muted:#667085;
-         --primary:#6a11cb; --primary2:#7b3efc; --ok:#16a34a; --warn:#f59e0b; --err:#ef4444; }
+  :root{
+    --bg1:#6a11cb; --bg2:#2575fc;
+    --card:#ffffff; --line:#e6e8ef; --text:#0f172a; --muted:#667085;
+    --primary:#6a11cb; --primary2:#7b3efc; --ok:#16a34a; --warn:#f59e0b; --err:#ef4444;
+  }
   *{box-sizing:border-box}
   body{margin:0;background:linear-gradient(135deg,var(--bg1),var(--bg2)) fixed;min-height:100vh;
-       font-family:system-ui,Segoe UI,Arial,sans-serif;color:#0f172a}
+       font-family:system-ui,Segoe UI,Arial,sans-serif;color:var(--text)}
   header{padding:22px 28px;color:#fff;display:flex;align-items:center;justify-content:space-between}
   header h1{margin:0;font-size:20px;font-weight:700}
   main{max-width:1200px;margin:0 auto;padding:20px}
@@ -426,7 +425,8 @@ DASHBOARD_HTML = """<!doctype html><html lang="en" dir="ltr"><head>
   .panel{padding:16px 18px}
   .row{display:flex;gap:12px;flex-wrap:wrap}
   .row>*{flex:1;min-width:190px}
-  input,select{width:100%;border:1px solid #cfd4dc;background:#fff;color:#0f172a;border-radius:12px;padding:10px 12px}
+  input,select{width:100%;border:1px solid #cfd4dc;background:#fff;color:var(--text);border-radius:12px;padding:10px 12px}
+  input[type=password]{font-family:Segoe UI, Arial, sans-serif}
   table{width:100%;border-collapse:collapse;background:#fff}
   th,td{padding:12px;border-bottom:1px solid #eef0f5;text-align:left}
   th{color:#334155;font-weight:600}
@@ -442,6 +442,8 @@ DASHBOARD_HTML = """<!doctype html><html lang="en" dir="ltr"><head>
       border-radius:50%;position:relative;border:1px solid rgba(255,255,255,.25)}
   .donut::after{content:attr(data-label);position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
       color:#fff;font-weight:700;font-size:18px}
+  .grid{display:grid;grid-template-columns:1fr;gap:16px}
+  @media(min-width:900px){ .grid{grid-template-columns:1fr 1fr} }
 </style>
 </head>
 <body>
@@ -470,7 +472,7 @@ DASHBOARD_HTML = """<!doctype html><html lang="en" dir="ltr"><head>
     <!-- FILTERS -->
     <section class="card panel">
       <div class="row">
-        <input id="apiKey" placeholder="API Token" type="password" autocomplete="off" />
+        <input id="apiKey" type="password" placeholder="API Token" />
         <input id="walletId" placeholder="Wallet ID (uuid)" />
         <input id="dateFrom" type="date" />
         <input id="dateTo" type="date" />
@@ -508,7 +510,7 @@ DASHBOARD_HTML = """<!doctype html><html lang="en" dir="ltr"><head>
         <button class="btn primary" id="txDo">Submit</button>
         <button class="btn" id="txCancel">Cancel</button>
       </div>
-      <div id="txMsg" style="margin-top:10px;color:#667085"></div>
+      <div id="txMsg" style="margin-top:10px;color:var(--muted)"></div>
     </section>
 
     <div class="footer">© nono-wallet</div>
@@ -527,18 +529,10 @@ const curBal = $("#curBal");
 const btnCsv = $("#btnCsv");
 
 const LS_KEY="nono_api_key", LS_WAL="nono_last_wallet";
-
-// لا نظهر التوكن المحفوظ بالمجال، فقط Placeholder
-const savedKey = localStorage.getItem(LS_KEY)||"";
-if(savedKey){ apiKeyEl.placeholder = "Saved ✓"; }
+apiKeyEl.value = localStorage.getItem(LS_KEY)||"";
 walletEl.value = localStorage.getItem(LS_WAL)||"";
 
-// الهيدر يقرأ من localStorage أولاً
-function hdr(){
-  const k = (localStorage.getItem(LS_KEY) || apiKeyEl.value || "").trim();
-  return {"X-Api-Key": k};
-}
-
+function hdr(){ return {"X-Api-Key": apiKeyEl.value.trim() }; }
 function fmtMoney(n){ return new Intl.NumberFormat("en-US",{style:"currency",currency:"USD",maximumFractionDigits:8}).format(Number(n)||0); }
 function setDonut(pct){
   const deg = Math.max(0,Math.min(100,pct))*3.6;
@@ -547,26 +541,13 @@ function setDonut(pct){
 }
 
 $("#btnSaveKey").onclick = ()=>{
-  const k = apiKeyEl.value.trim();
-  if(k) localStorage.setItem(LS_KEY, k);
+  localStorage.setItem(LS_KEY, apiKeyEl.value.trim());
   localStorage.setItem(LS_WAL, walletEl.value.trim());
-  apiKeyEl.value = "";
-  apiKeyEl.placeholder = "Saved ✓";
-  alert("Saved");
+  alert("Saved ✓");
 };
 
 $("#btnNewTx").onclick = ()=>$("#newTx").style.display="block";
 $("#txCancel").onclick = ()=>$("#newTx").style.display="none";
-
-// لو كتب المستخدم توكن جديد، نخزّنه ونُفرّغ الحقل مباشرة
-apiKeyEl.addEventListener("change", ()=>{
-  const k = apiKeyEl.value.trim();
-  if(k){
-    localStorage.setItem(LS_KEY, k);
-    apiKeyEl.value = "";
-    apiKeyEl.placeholder = "Saved ✓";
-  }
-});
 
 async function fetchBalance(){
   const id = walletEl.value.trim();
@@ -587,10 +568,8 @@ async function depositWithdraw(kind, amount){
   if(!id) return alert("Wallet ID required");
   if(!(amount>0)) return alert("Amount must be > 0");
   const url = (kind==="deposit")?"/wallet/deposit":"/wallet/withdraw";
-  const headers = {...hdr(),"Content-Type":"application/json"};
-  // Idempotency من الواجهة
-  headers["Idempotency-Key"] = "web-"+Date.now()+"-"+Math.random().toString(16).slice(2);
-  const r = await fetch(url,{method:"POST",headers, body: JSON.stringify({wallet_id:id, amount:Number(amount)})});
+  const r = await fetch(url,{method:"POST",headers:{...hdr(),"Content-Type":"application/json"},
+      body: JSON.stringify({wallet_id:id, amount:Number(amount)})});
   const j = await r.json();
   if(!j.ok) alert(j.error||"Error"); else { await fetchBalance(); await loadTx(); }
 }
@@ -653,10 +632,13 @@ async function loadTx(){
       const total = dep + wd;
       setDonut(total? (dep/total*100) : 0);
     }
-    btnCsv.href = `/transactions/export.csv?${qs.toString()}`;
+    // CSV: نمرر sep و filename مناسبين لإكسل
+    const fname = `transactions_${(w||'all').slice(0,8)}.csv`;
+    btnCsv.href = `/transactions/export.csv?${qs.toString()}&sep=%3B&filename=${encodeURIComponent(fname)}`;
   }catch(e){}
 }
 
+apiKeyEl.addEventListener("change", ()=>localStorage.setItem(LS_KEY, apiKeyEl.value.trim()));
 walletEl.addEventListener("change", ()=>{ localStorage.setItem(LS_WAL, walletEl.value.trim()); fetchBalance(); loadTx(); });
 searchEl.addEventListener("input", ()=>loadTx());
 fromEl.addEventListener("change", ()=>loadTx());
