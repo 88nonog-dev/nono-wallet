@@ -1,8 +1,9 @@
-# نُصدر app لأن railway.toml يستخدم startCommand = "gunicorn wsgi:app ..."
-try:
-    from app import application as app
-except ImportError:
-    from app import app as app
+from app import app, db
 
-# إبقاء alias application (اختياري)
-application = app
+
+# تأكد من إنشاء الجداول عند بدء التشغيل (للبيئات البسيطة بدون Alembic)
+with app.app_context():
+try:
+db.create_all()
+except Exception as e:
+app.logger.warning(f"db.create_all warning: {e}")
