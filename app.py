@@ -78,3 +78,8 @@ logging.basicConfig(level=logging.INFO)
 with app.app_context():
 db.create_all()
 app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+from flask import render_template
+
+@app.route("/")
+def dashboard():
+    return render_template("dashboard.html", api_token=os.getenv("API_TOKEN",""))
