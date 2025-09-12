@@ -1,17 +1,17 @@
-import os
+﻿import os
 from datetime import datetime
 from flask import Flask, request, jsonify, Response, render_template
 from flask_sqlalchemy import SQLAlchemy
 
 # -----------------------------------------------------------------------------
-# قاعدة البيانات (يدعم PostgreSQL/SQLite) + تصحيح شائع
+# ظ‚ط§ط¹ط¯ط© ط§ظ„ط¨ظٹط§ظ†ط§طھ (ظٹط¯ط¹ظ… PostgreSQL/SQLite) + طھطµط­ظٹط­ ط´ط§ط¦ط¹
 # -----------------------------------------------------------------------------
 def _build_db_url() -> str:
     url = os.getenv("DATABASE_URL", "sqlite:///wallet.db")
-    # Railway أحيانًا يمرر postgres:// بدل postgresql://
+    # Railway ط£ط­ظٹط§ظ†ظ‹ط§ ظٹظ…ط±ط± postgres:// ط¨ط¯ظ„ postgresql://
     if url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql://", 1)
-    # لو أحد كتب :PORT/ نصياً بدل رقم
+    # ظ„ظˆ ط£ط­ط¯ ظƒطھط¨ :PORT/ ظ†طµظٹط§ظ‹ ط¨ط¯ظ„ ط±ظ‚ظ…
     if ":PORT/" in url:
         url = url.replace(":PORT/", ":5432/", 1)
     return url
@@ -23,7 +23,7 @@ app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 db = SQLAlchemy(app)
 
 # -----------------------------------------------------------------------------
-# الموديلات
+# ط§ظ„ظ…ظˆط¯ظٹظ„ط§طھ
 # -----------------------------------------------------------------------------
 class Wallet(db.Model):
     __tablename__ = "wallets"
@@ -35,7 +35,7 @@ class Transaction(db.Model):
     __tablename__ = "transactions"
     id = db.Column(db.Integer, primary_key=True)
     wallet_id = db.Column(db.Integer, db.ForeignKey("wallets.id"), nullable=False)
-    amount = db.Column(db.Float, nullable=False)       # موجب = إيداع، سالب = سحب
+    amount = db.Column(db.Float, nullable=False)       # ظ…ظˆط¬ط¨ = ط¥ظٹط¯ط§ط¹طŒ ط³ط§ظ„ط¨ = ط³ط­ط¨
     tx_type = db.Column(db.String(16), nullable=False) # deposit / withdraw
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
     idempotency_key = db.Column(db.String(64), unique=True, nullable=True)
@@ -44,13 +44,13 @@ with app.app_context():
     db.create_all()
 
 # -----------------------------------------------------------------------------
-# مساعدات
+# ظ…ط³ط§ط¹ط¯ط§طھ
 # -----------------------------------------------------------------------------
 def require_api_token():
     api_token_env = os.getenv("API_TOKEN", "nonoSuperKey2025")
     sent = request.headers.get("X-Api-Token", "")
     if not api_token_env or sent != api_token_env:
-        # نرجّع قيمتين فقط: False, و (Response, status) كتلة وحدة
+        # ظ†ط±ط¬ظ‘ط¹ ظ‚ظٹظ…طھظٹظ† ظپظ‚ط·: False, ظˆ (Response, status) ظƒطھظ„ط© ظˆط­ط¯ط©
         return False, (jsonify({"ok": False, "error": "unauthorized"}), 401)
     return True, None
 
@@ -61,7 +61,7 @@ def wallet_required(wid: int):
     return db.session.get(Wallet, wid)
 
 # -----------------------------------------------------------------------------
-# صحّة الخدمة وهوية
+# طµط­ظ‘ط© ط§ظ„ط®ط¯ظ…ط© ظˆظ‡ظˆظٹط©
 # -----------------------------------------------------------------------------
 @app.route("/health")
 def health():
@@ -76,7 +76,7 @@ def whoami():
     return jsonify({"ok": True, "service": "nono-wallet"})
 
 # -----------------------------------------------------------------------------
-# إنشاء محفظة
+# ط¥ظ†ط´ط§ط، ظ…ط­ظپط¸ط©
 # -----------------------------------------------------------------------------
 @app.route("/wallet/create", methods=["POST"])
 def wallet_create():
@@ -93,7 +93,7 @@ def wallet_create():
 
     w = Wallet(name=name, balance=0.0)
     db.session.add(w)
-    db.session.flush()  # حتى نأخذ id قبل الكومِت
+    db.session.flush()  # ط­طھظ‰ ظ†ط£ط®ط° id ظ‚ط¨ظ„ ط§ظ„ظƒظˆظ…ظگطھ
 
     if initial != 0:
         t = Transaction(
@@ -109,7 +109,7 @@ def wallet_create():
     return jsonify({"ok": True, "wallet_id": w.id, "balance": w.balance})
 
 # -----------------------------------------------------------------------------
-# إيداع
+# ط¥ظٹط¯ط§ط¹
 # -----------------------------------------------------------------------------
 @app.route("/wallet/deposit", methods=["POST"])
 def wallet_deposit():
@@ -140,7 +140,7 @@ def wallet_deposit():
     return jsonify({"ok": True, "wallet_id": w.id, "balance": w.balance})
 
 # -----------------------------------------------------------------------------
-# سحب
+# ط³ط­ط¨
 # -----------------------------------------------------------------------------
 @app.route("/wallet/withdraw", methods=["POST"])
 def wallet_withdraw():
@@ -174,7 +174,7 @@ def wallet_withdraw():
     return jsonify({"ok": True, "wallet_id": w.id, "balance": w.balance})
 
 # -----------------------------------------------------------------------------
-# الرصيد
+# ط§ظ„ط±طµظٹط¯
 # -----------------------------------------------------------------------------
 @app.route("/wallet/balance")
 def wallet_balance():
@@ -193,7 +193,7 @@ def wallet_balance():
     return jsonify({"ok": True, "wallet_id": w.id, "balance": w.balance})
 
 # -----------------------------------------------------------------------------
-# السجل
+# ط§ظ„ط³ط¬ظ„
 # -----------------------------------------------------------------------------
 @app.route("/transactions")
 def transactions():
@@ -220,7 +220,7 @@ def transactions():
     return jsonify({"ok": True, "items": [_row(t) for t in items]})
 
 # -----------------------------------------------------------------------------
-# تصدير CSV
+# طھطµط¯ظٹط± CSV
 # -----------------------------------------------------------------------------
 @app.route("/export/csv")
 def export_csv():
@@ -246,13 +246,13 @@ def export_csv():
     )
 
 # -----------------------------------------------------------------------------
-# الواجهة الأمامية — مؤقتًا نص بسيط حتى نثبت النشر أخضر
-# (نرجع نربط dashboard.html بعد الاستقرار)
+# ط§ظ„ظˆط§ط¬ظ‡ط© ط§ظ„ط£ظ…ط§ظ…ظٹط© â€” ظ…ط¤ظ‚طھظ‹ط§ ظ†طµ ط¨ط³ظٹط· ط­طھظ‰ ظ†ط«ط¨طھ ط§ظ„ظ†ط´ط± ط£ط®ط¶ط±
+# (ظ†ط±ط¬ط¹ ظ†ط±ط¨ط· dashboard.html ط¨ط¹ط¯ ط§ظ„ط§ط³طھظ‚ط±ط§ط±)
 # -----------------------------------------------------------------------------
 @app.route("/")
 def dashboard():
-    return "Nono Wallet UI up", 200
+        return render_template("dashboard.html", api_token=os.getenv("API_TOKEN",""))
 
-# تشغيل محلي فقط (Railway يستخدم gunicorn: app:app)
+# طھط´ط؛ظٹظ„ ظ…ط­ظ„ظٹ ظپظ‚ط· (Railway ظٹط³طھط®ط¯ظ… gunicorn: app:app)
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
