@@ -253,6 +253,43 @@ def wallet_balance():
     if not w:
         return jsonify({"ok": False, "error": "wallet_not_found"}), 404
     return jsonify({"ok": True, "wallet": wallet_json(w)}), 200
+# -----------------------------------------------------------------------------
+# سجل الحركات
+# -----------------------------------------------------------------------------
+@app.route("/wallet/transactions", methods=["GET"])
+def wallet_transactions():
+    user_id = (request.args.get("user_id") or "").strip()
+    if not user_id:
+        return jsonify({"ok": False, "error": "user_id is required"}), 400
+
+    w = Wallet.query.filter_by(user_id=user_id).first()
+    if not w:
+        return jsonify({"ok": False, "error": "wallet_not_found"}), 404
+
+    # باراميترات اختيارية: limit و offset
+    try:
+        limit = int(request.args.get("limit", "20"))
+        offset = int(request.args.get("offset", "0"))
+    except ValueError:
+        return jsonify({"ok": False, "error": "invalid_pagination"}), 400
+
+    q = (Transaction.query
+         .filter_by(wallet_id=w.id)
+         .order_by(Transaction.id.desc())
+         .offset(offset)
+         .limit(min(max(limit, 1), 100)))  # 1..100
+
+    items = []
+    for t in q.all():
+        items.append({
+            "id": t.id,
+            "type": t.type,
+            "amount": str(t.amount),
+            "created_at": t.created_at.isoformat(),
+            "meta": t.meta
+        })
+
+    return jsonify({"ok": True, "wallet": wallet_json(w), "transactions": items}), 200
 
 # -----------------------------------------------------------------------------
 # تشغيل محلي
