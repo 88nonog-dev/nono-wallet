@@ -12,13 +12,23 @@ from sqlalchemy import inspect
 # -----------------------------------------------------------------------------
 app = Flask(__name__)
 
-# --- API Key protection ---
-API_KEY = os.environ.get("API_KEY")  # نضبط قيمته لاحقًا من متغيرات البيئة
+db_url = os.environ.get("DATABASE_URL", "sqlite:///nono_wallet.db")
+app.config["SQLALCHEMY_DATABASE_URI"] = db_url
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+db = SQLAlchemy(app)
+
+# -----------------------------------------------------------------------------
+# حماية API بالمفتاح
+# -----------------------------------------------------------------------------
+API_KEY = os.environ.get("API_KEY")  # نضبطه في Railway Variables
 from flask import abort
+
 @app.before_request
 def require_api_key():
+    # اسمح لطريق الصحة بدون مفتاح
     if request.path == "/health":
         return
+    # إذا ما محدد API_KEY في البيئة، نسمح (وضع التطوير)
     if not API_KEY:
         return
     provided = request.headers.get("X-API-Key")
@@ -29,33 +39,18 @@ def require_api_key():
 # الموديلات
 # -----------------------------------------------------------------------------
 class Wallet(db.Model):
-    ...
-
-# DATABASE_URL من الـ ENV (Railway) أو SQLite محليًا
-db_url = os.environ.get("DATABASE_URL", "sqlite:///nono_wallet.db")
-app.config["SQLALCHEMY_DATABASE_URI"] = db_url
-app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-
-db = SQLAlchemy(app)
-
-# -----------------------------------------------------------------------------
-# الموديلات
-# -----------------------------------------------------------------------------
-class Wallet(db.Model):
     __tablename__ = "wallets"
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.String(64), nullable=False, index=True, unique=True)
     balance = db.Column(db.Numeric(38, 8), nullable=False, default=0)
-    # ملاحظة: عمود name قد لا يكون موجود، الراوتات تتعامل مع غيابه.
-    # name = db.Column(db.String(120))
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
 
 class Transaction(db.Model):
     __tablename__ = "transactions"
     id = db.Column(db.Integer, primary_key=True)
     wallet_id = db.Column(db.Integer, db.ForeignKey("wallets.id"), nullable=False, index=True)
-    amount = db.Column(db.Numeric(38, 8), nullable=False)  # موجب للإيداع، سالب للسحب/التحويل الخارح
-    type = db.Column(db.String(16), nullable=False)        # deposit | withdraw | transfer_in | transfer_out
+    amount = db.Column(db.Numeric(38, 8), nullable=False)
+    type = db.Column(db.String(16), nullable=False)
     meta = db.Column(db.JSON, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
 
@@ -103,7 +98,7 @@ def health():
     return jsonify({"ok": True, "service": "nono-wallet", "db": True}), 200
 
 # -----------------------------------------------------------------------------
-# إنشاء محفظة (آمن لو عمود name غير موجود)
+# إنشاء محفظة
 # -----------------------------------------------------------------------------
 @app.route("/wallet/create", methods=["POST"])
 def create_wallet():
@@ -117,7 +112,6 @@ def create_wallet():
         return jsonify({"ok": False, "error": "invalid initial_deposit"}), 400
 
     desired_name = data.get("name")
-
     try:
         wallet = Wallet.query.filter_by(user_id=user_id).first()
         if wallet is None:
@@ -126,24 +120,16 @@ def create_wallet():
             db.session.flush()
 
         name_applied = False
-        if desired_name:
-            if table_has_column(db.engine, Wallet.__tablename__, "name"):
-                db.session.execute(
-                    f'UPDATE {Wallet.__tablename__} SET name = :name WHERE id = :wid',
-                    {"name": str(desired_name)[:120], "wid": wallet.id}
-                )
-                name_applied = True
-            else:
-                app.logger.warning("Column `name` not found on wallets — skipping name assignment.")
+        if desired_name and table_has_column(db.engine, Wallet.__tablename__, "name"):
+            db.session.execute(
+                f'UPDATE {Wallet.__tablename__} SET name = :name WHERE id = :wid',
+                {"name": str(desired_name)[:120], "wid": wallet.id}
+            )
+            name_applied = True
 
         tx_id = None
         if initial_deposit and initial_deposit > 0:
-            tx = Transaction(
-                wallet_id=wallet.id,
-                amount=initial_deposit,
-                type="deposit",
-                meta={"reason": "initial_deposit"}
-            )
+            tx = Transaction(wallet_id=wallet.id, amount=initial_deposit, type="deposit", meta={"reason": "initial_deposit"})
             db.session.add(tx)
             wallet.balance = wallet.balance + initial_deposit
             db.session.flush()
@@ -152,18 +138,11 @@ def create_wallet():
         db.session.commit()
         return jsonify({
             "ok": True,
-            "wallet": {
-                "id": wallet.id,
-                "user_id": wallet.user_id,
-                "balance": str(wallet.balance),
-                "name_set": name_applied
-            },
+            "wallet": {"id": wallet.id, "user_id": wallet.user_id, "balance": str(wallet.balance), "name_set": name_applied},
             "initial_deposit_tx_id": tx_id
         }), 201
-
     except Exception as e:
         db.session.rollback()
-        app.logger.exception("wallet/create failed")
         return jsonify({"ok": False, "error": "internal_error", "detail": str(e)}), 500
 
 # -----------------------------------------------------------------------------
@@ -171,10 +150,6 @@ def create_wallet():
 # -----------------------------------------------------------------------------
 @app.route("/wallet/deposit", methods=["POST"])
 def wallet_deposit():
-    """
-    JSON: { "user_id": "u_2", "amount": 50 }
-    ينشئ المحفظة إذا غير موجودة.
-    """
     data = request.get_json(silent=True) or {}
     user_id = (data.get("user_id") or "").strip()
     amount = to_decimal(data.get("amount", 0))
@@ -186,14 +161,13 @@ def wallet_deposit():
 
     try:
         w = get_or_create_wallet(user_id)
-        tx = Transaction(wallet_id=w.id, amount=amount, type="deposit", meta=None)
+        tx = Transaction(wallet_id=w.id, amount=amount, type="deposit")
         db.session.add(tx)
         w.balance = w.balance + amount
         db.session.commit()
         return jsonify({"ok": True, "wallet": wallet_json(w)}), 200
     except Exception as e:
         db.session.rollback()
-        app.logger.exception("wallet/deposit failed")
         return jsonify({"ok": False, "error": "internal_error", "detail": str(e)}), 500
 
 # -----------------------------------------------------------------------------
@@ -201,10 +175,6 @@ def wallet_deposit():
 # -----------------------------------------------------------------------------
 @app.route("/wallet/withdraw", methods=["POST"])
 def wallet_withdraw():
-    """
-    JSON: { "user_id": "u_2", "amount": 20 }
-    يرفض إذا الرصيد ما يكفي.
-    """
     data = request.get_json(silent=True) or {}
     user_id = (data.get("user_id") or "").strip()
     amount = to_decimal(data.get("amount", 0))
@@ -222,14 +192,13 @@ def wallet_withdraw():
         if w.balance < amount:
             return jsonify({"ok": False, "error": "insufficient_funds", "balance": str(w.balance)}), 400
 
-        tx = Transaction(wallet_id=w.id, amount=-amount, type="withdraw", meta=None)
+        tx = Transaction(wallet_id=w.id, amount=-amount, type="withdraw")
         db.session.add(tx)
         w.balance = w.balance - amount
         db.session.commit()
         return jsonify({"ok": True, "wallet": wallet_json(w)}), 200
     except Exception as e:
         db.session.rollback()
-        app.logger.exception("wallet/withdraw failed")
         return jsonify({"ok": False, "error": "internal_error", "detail": str(e)}), 500
 
 # -----------------------------------------------------------------------------
@@ -237,10 +206,6 @@ def wallet_withdraw():
 # -----------------------------------------------------------------------------
 @app.route("/wallet/transfer", methods=["POST"])
 def wallet_transfer():
-    """
-    JSON: { "from_user_id": "u_2", "to_user_id": "u_3", "amount": 10 }
-    ينشئ محفظة المستلم إذا غير موجودة.
-    """
     data = request.get_json(silent=True) or {}
     from_uid = (data.get("from_user_id") or "").strip()
     to_uid = (data.get("to_user_id") or "").strip()
@@ -263,24 +228,17 @@ def wallet_transfer():
 
         receiver = get_or_create_wallet(to_uid)
 
-        tx_out = Transaction(wallet_id=sender.id, amount=-amount, type="transfer_out",
-                             meta={"to_user_id": to_uid})
-        tx_in = Transaction(wallet_id=receiver.id, amount=amount, type="transfer_in",
-                            meta={"from_user_id": from_uid})
+        tx_out = Transaction(wallet_id=sender.id, amount=-amount, type="transfer_out", meta={"to_user_id": to_uid})
+        tx_in = Transaction(wallet_id=receiver.id, amount=amount, type="transfer_in", meta={"from_user_id": from_uid})
         db.session.add_all([tx_out, tx_in])
 
         sender.balance = sender.balance - amount
         receiver.balance = receiver.balance + amount
 
         db.session.commit()
-        return jsonify({
-            "ok": True,
-            "from_wallet": wallet_json(sender),
-            "to_wallet": wallet_json(receiver)
-        }), 200
+        return jsonify({"ok": True, "from_wallet": wallet_json(sender), "to_wallet": wallet_json(receiver)}), 200
     except Exception as e:
         db.session.rollback()
-        app.logger.exception("wallet/transfer failed")
         return jsonify({"ok": False, "error": "internal_error", "detail": str(e)}), 500
 
 # -----------------------------------------------------------------------------
@@ -302,4 +260,3 @@ def wallet_balance():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
-
