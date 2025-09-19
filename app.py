@@ -12,6 +12,25 @@ from sqlalchemy import inspect
 # -----------------------------------------------------------------------------
 app = Flask(__name__)
 
+# --- API Key protection ---
+API_KEY = os.environ.get("API_KEY")  # نضبط قيمته لاحقًا من متغيرات البيئة
+from flask import abort
+@app.before_request
+def require_api_key():
+    if request.path == "/health":
+        return
+    if not API_KEY:
+        return
+    provided = request.headers.get("X-API-Key")
+    if provided != API_KEY:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+# -----------------------------------------------------------------------------
+# الموديلات
+# -----------------------------------------------------------------------------
+class Wallet(db.Model):
+    ...
+
 # DATABASE_URL من الـ ENV (Railway) أو SQLite محليًا
 db_url = os.environ.get("DATABASE_URL", "sqlite:///nono_wallet.db")
 app.config["SQLALCHEMY_DATABASE_URI"] = db_url
