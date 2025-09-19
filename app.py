@@ -290,6 +290,12 @@ def wallet_transactions():
         })
 
     return jsonify({"ok": True, "wallet": wallet_json(w), "transactions": items}), 200
+# -----------------------------------------------------------------------------
+# صفحة الجذر (Root)
+# -----------------------------------------------------------------------------
+@app.route("/", methods=["GET"])
+def root():
+    return jsonify({"ok": True, "service": "nono-wallet", "message": "Service OK"}), 200
 
 # -----------------------------------------------------------------------------
 # تشغيل محلي
