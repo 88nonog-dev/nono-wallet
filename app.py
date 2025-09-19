@@ -25,9 +25,9 @@ from flask import abort
 
 @app.before_request
 def require_api_key():
-    # اسمح لطريق الصحة بدون مفتاح
-    if request.path == "/health":
+    if request.path in ["/health", "/"]:
         return
+
     # إذا ما محدد API_KEY في البيئة، نسمح (وضع التطوير)
     if not API_KEY:
         return
